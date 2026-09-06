@@ -207,9 +207,9 @@ def sepay_webhook():
     data = request.get_json(force=True, silent=True) or {}
 
     noi_dung = data.get("content", "")
-    so_tien = data.get("amount", 0)
-    loai_gd = data.get("transfer_type")  # "credit" = tiền vào, "debit" = tiền ra
-    is_income = (loai_gd == "credit")
+    so_tien = data.get("transferAmount", 0)
+    loai_gd = data.get("transferType")  # "in" = tiền vào, "out" = tiền ra
+    is_income = (loai_gd == "in")
 
     try:
         thu_total, chi_total, remain = append_transaction_and_upload(so_tien, is_income)
@@ -217,7 +217,7 @@ def sepay_webhook():
         # trả lỗi để SePay tự động retry
         return jsonify({"success": False, "message": str(e)}), 500
 
-    loai_text = "💰 Nhận tiền" if is_income else "💸 Chi tiền"
+    loai_text = f"💰 Nhận tiền (transferType={loai_gd})" if is_income else f"💸 Chi tiền (transferType={loai_gd})"
     send_telegram_notification(
         f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
         f"Nội dung: {noi_dung}\n"
