@@ -4,6 +4,7 @@ import io
 import json
 import threading
 from datetime import datetime
+from urllib.parse import quote
 import pytz
 import requests
 import msal
@@ -70,7 +71,6 @@ def get_excel_data():
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        # Lấy dữ liệu (đã có sẵn ô tổng và ô còn lại)
         thu_total = sheet['A29'].value or 0
         chi_total = sheet['B29'].value or 0
         remain = sheet['A31'].value or 0
@@ -115,29 +115,64 @@ def get_graph_access_token():
 
     result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
     if not result or "access_token" not in result:
-        raise Exception(f"Không lấy được access token, cần chạy lại setup_onedrive_token.py")
+        raise Exception(f"Không lấy được access token, cần chạy lại setup_onedrive_token.py. Chi tiết: {result}")
 
     return result["access_token"]
+
+def get_encoded_file_path():
+    """
+    Chuẩn hóa đường dẫn OneDrive thành đúng định dạng Graph API.
+    Ví dụ: "Thu muc/SoThuChi.xlsx" -> "Thu%20muc:/SoThuChi.xlsx"
+    """
+    path = ONEDRIVE_FILE_PATH.strip().strip('/')
+    if not path:
+        raise Exception("ONEDRIVE_FILE_PATH đang trống trên Render!")
+        
+    if '/' in path:
+        folder, filename = path.rsplit('/', 1)
+        return f"{quote(folder)}:/{quote(filename)}"
+    else:
+        return quote(path)
 
 def download_excel_for_write():
     """Tải file Excel qua Graph API (để có thể ghi lại đúng file này)."""
     token = get_graph_access_token()
-    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{ONEDRIVE_FILE_PATH}:/content"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
-    resp.raise_for_status()
-    return resp.content
+    file_path = get_encoded_file_path()
+    
+    # URL chuẩn: root:/Thu muc:/File.xlsx:/content
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
+    
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        raise Exception(f"Lỗi tải file: {str(e)}. Kiểm tra lại ONEDRIVE_FILE_PATH.")
 
 def upload_excel(content_bytes):
     """Ghi đè nội dung file Excel lên OneDrive qua Graph API."""
     token = get_graph_access_token()
-    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{ONEDRIVE_FILE_PATH}:/content"
+    file_path = get_encoded_file_path()
+    
+    # URL chuẩn: root:/Thu muc:/File.xlsx:/content
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
+    
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
-    resp = requests.put(url, headers=headers, data=content_bytes, timeout=60) # Tăng timeout lên 60s
-    resp.raise_for_status()
-    return resp.json()
+    
+    try:
+        resp = requests.put(url, headers=headers, data=content_bytes, timeout=60) 
+        
+        # In ra lỗi chi tiết nếu Graph API trả về lỗi
+        if resp.status_code != 200 and resp.status_code != 201:
+            print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
+            resp.raise_for_status()
+            
+        return resp.json()
+    except Exception as e:
+        raise Exception(f"Lỗi upload: {str(e)}. Có thể do Token hết hạn hoặc đường dẫn file sai.")
 
 def append_transaction_and_upload(amount, is_income):
     """
@@ -145,7 +180,7 @@ def append_transaction_and_upload(amount, is_income):
     Dùng công thức Excel để tự cập nhật tổng, sau đó upload lại.
     """
     content = download_excel_for_write()
-    workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False) # data_only=False để giữ công thức
+    workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
     sheet = workbook.active
 
     col = 1 if is_income else 2  # A=1 (Thu), B=2 (Chi)
@@ -162,7 +197,7 @@ def append_transaction_and_upload(amount, is_income):
     # Ghi số tiền vào ô trống
     sheet.cell(row=target_row, column=col).value = amount
 
-    # Cập nhật lại công thức Excel (để chắc chắn nó tính đúng nếu bị xóa công thức)
+    # Cập nhật lại công thức Excel
     sheet['A29'].value = '=SUM(A2:A25)'
     sheet['B29'].value = '=SUM(B2:B25)'
     sheet['A31'].value = '=A29-B29'
@@ -188,7 +223,6 @@ def sepay_webhook():
     data = request.get_json(force=True, silent=True) or {}
     
     # Trả về 200 ngay lập tức để SePay không retry
-    # Sau đó xử lý ở thread riêng
     threading.Thread(target=process_transaction, args=(data,)).start()
     
     return jsonify({"success": True}), 200
@@ -263,25 +297,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_excel_data()
         await query.message.reply_text(report, parse_mode="HTML")
 
-# ================== KHAI BÁO WEBHOOK ==================
-async def setup_webhook(application):
-    """Tự động cài đặt Webhook khi bot khởi động trên Render."""
-    port = int(os.environ.get("PORT", 10000))
-    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'your-app.onrender.com')}/webhook" 
-    # Lưu ý: Nếu bạn set telegram bot chỉ để trả lời lệnh /start và /1 thì không cần webhook cho Telegram, dùng Polling cũng được.
-    # Tuy nhiên, trên Render, Polling dễ gây Conflict nếu bạn deploy 2 lần. 
-    # Nếu muốn chạy Webhook:
-    # await application.bot.set_webhook(url=webhook_url)
-    pass 
-
+# ================== MAIN ==================
 def main():
     if not TOKEN:
         print("LỖI: Chưa cài đặt BOT_TOKEN!")
         sys.exit(1)
 
-    # Khởi động Flask trước (để webhook hoạt động)
+    # Khởi động Flask trước (để webhook hoạt động) - use_reloader=False để tránh chạy 2 lần
     port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port), daemon=True).start()
+    threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
     # Khởi động Telegram Bot
     application = Application.builder().token(TOKEN).build()
@@ -292,8 +316,7 @@ def main():
 
     print("Bot đang chạy...")
     
-    # Chạy Polling để lấy lệnh Telegram (Nếu bạn muốn chạy Webhook cho Telegram thì bỏ dòng này và dùng application.run_webhook)
-    # Lưu ý: Render sẽ hỗ trợ chạy polling. Nếu trước đó bạn từng chạy webhook, hãy vào link deleteWebhook để xóa.
+    # Chạy Polling để lấy lệnh Telegram
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
