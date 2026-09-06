@@ -1,7 +1,6 @@
 import os
 import sys
 import io
-import json
 import threading
 from datetime import datetime
 from urllib.parse import quote
@@ -16,7 +15,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== CẤU HÌNH MÔI TRƯỜNG ==================
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Link OneDrive dạng tải về trực tiếp (dùng để ĐỌC, giữ nguyên như cũ)
+# Link OneDrive dạng tải về trực tiếp (dùng để ĐỌC)
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 
 # ====== CẤU HÌNH MỚI - dùng để GHI vào OneDrive qua Graph API ======
@@ -71,9 +70,10 @@ def get_excel_data():
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        thu_total = sheet['A29'].value or 0
-        chi_total = sheet['B29'].value or 0
-        remain = sheet['A31'].value or 0
+        # Tính tổng trực tiếp từ các ô dữ liệu (2 đến 25) để tránh lỗi đọc công thức
+        thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
+        chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
+        remain = thu_total - chi_total
 
         thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 26) if sheet.cell(row=i, column=1).value is not None]
         chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 26) if sheet.cell(row=i, column=2).value is not None]
@@ -89,9 +89,9 @@ def get_excel_data():
             msg += f"  • {val:,.0f} VNĐ\n" if isinstance(val, (int, float)) else f"  • {val}\n"
 
         msg += "----------------------------------------\n"
-        msg += f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total:,.0f}</code> VNĐ\n" if isinstance(thu_total, (int, float)) else f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total}</code> VNĐ\n"
-        msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n" if isinstance(chi_total, (int, float)) else f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total}</code> VNĐ\n"
-        msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n" if isinstance(remain, (int, float)) else f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain}</code> VNĐ\n"
+        msg += f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total:,.0f}</code> VNĐ\n"
+        msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
+        msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
 
         return msg
     except requests.exceptions.Timeout:
@@ -103,7 +103,7 @@ def get_excel_data():
 def get_graph_access_token():
     """Lấy access token bằng token cache đã xin quyền từ trước."""
     if not ONEDRIVE_TOKEN_CACHE:
-        raise Exception("Chưa cấu hình ONEDRIVE_TOKEN_CACHE")
+        raise Exception("ONEDRIVE_TOKEN_CACHE đang trống trên Render!")
 
     cache = msal.SerializableTokenCache()
     cache.deserialize(ONEDRIVE_TOKEN_CACHE)
@@ -120,10 +120,7 @@ def get_graph_access_token():
     return result["access_token"]
 
 def get_encoded_file_path():
-    """
-    Chuẩn hóa đường dẫn OneDrive thành đúng định dạng Graph API.
-    Ví dụ: "Thu muc/SoThuChi.xlsx" -> "Thu%20muc:/SoThuChi.xlsx"
-    """
+    """Chuẩn hóa đường dẫn file để tránh lỗi 400."""
     path = ONEDRIVE_FILE_PATH.strip().strip('/')
     if not path:
         raise Exception("ONEDRIVE_FILE_PATH đang trống trên Render!")
@@ -135,49 +132,38 @@ def get_encoded_file_path():
         return quote(path)
 
 def download_excel_for_write():
-    """Tải file Excel qua Graph API (để có thể ghi lại đúng file này)."""
+    """Tải file Excel qua Graph API."""
     token = get_graph_access_token()
     file_path = get_encoded_file_path()
-    
-    # URL chuẩn: root:/Thu muc:/File.xlsx:/content
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
-    
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
-        raise Exception(f"Lỗi tải file: {str(e)}. Kiểm tra lại ONEDRIVE_FILE_PATH.")
+        raise Exception(f"Lỗi tải file: {str(e)}")
 
 def upload_excel(content_bytes):
-    """Ghi đè nội dung file Excel lên OneDrive qua Graph API."""
+    """Ghi đè nội dung file Excel lên OneDrive."""
     token = get_graph_access_token()
     file_path = get_encoded_file_path()
-    
-    # URL chuẩn: root:/Thu muc:/File.xlsx:/content
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
-    
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
-    
     try:
-        resp = requests.put(url, headers=headers, data=content_bytes, timeout=60) 
-        
-        # In ra lỗi chi tiết nếu Graph API trả về lỗi
+        resp = requests.put(url, headers=headers, data=content_bytes, timeout=60)
         if resp.status_code != 200 and resp.status_code != 201:
             print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
             resp.raise_for_status()
-            
         return resp.json()
     except Exception as e:
-        raise Exception(f"Lỗi upload: {str(e)}. Có thể do Token hết hạn hoặc đường dẫn file sai.")
+        raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
     """
-    Thêm 1 giao dịch mới vào cột Thu (A) hoặc Chi (B), dòng 2-25,
-    Dùng công thức Excel để tự cập nhật tổng, sau đó upload lại.
+    Thêm 1 giao dịch mới, dùng công thức Excel để cập nhật tổng, sau đó upload.
     """
     content = download_excel_for_write()
     workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
@@ -185,19 +171,17 @@ def append_transaction_and_upload(amount, is_income):
 
     col = 1 if is_income else 2  # A=1 (Thu), B=2 (Chi)
 
-    # Tìm dòng trống đầu tiên trong khoảng 2-25
     target_row = None
     for i in range(2, 26):
         if sheet.cell(row=i, column=col).value is None:
             target_row = i
             break
     if target_row is None:
-        raise Exception("Hết chỗ trống trong bảng (đã đủ 24 dòng), cần dọn bớt dữ liệu cũ trong Excel")
+        raise Exception("Hết chỗ trống trong bảng Excel!")
 
-    # Ghi số tiền vào ô trống
     sheet.cell(row=target_row, column=col).value = amount
 
-    # Cập nhật lại công thức Excel
+    # Cập nhật công thức (đảm bảo các ô Tổng luôn đúng)
     sheet['A29'].value = '=SUM(A2:A25)'
     sheet['B29'].value = '=SUM(B2:B25)'
     sheet['A31'].value = '=A29-B29'
@@ -206,12 +190,6 @@ def append_transaction_and_upload(amount, is_income):
     workbook.save(buf)
     buf.seek(0)
     upload_excel(buf.read())
-
-def send_telegram_notification(text):
-    if not TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
@@ -228,29 +206,51 @@ def sepay_webhook():
     return jsonify({"success": True}), 200
 
 def process_transaction(data):
-    """Hàm chạy ngầm để ghi Excel, không làm nghẽn webhook."""
+    """Hàm chạy ngầm: Ghi Excel và Gửi thông báo."""
     try:
         noi_dung = data.get("content", "")
         so_tien = data.get("transferAmount", 0)
         loai_gd = data.get("transferType")  # "in" = tiền vào, "out" = tiền ra
         is_income = (loai_gd == "in")
 
+        # Ghi vào Excel
         append_transaction_and_upload(so_tien, is_income)
+        
+        # Tính lại số liệu để gửi lên Telegram
+        # Tải lại file (vừa ghi xong) để tính tổng chính xác
+        content = download_excel_for_write()
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        sh = wb.active
+        
+        thu_total = sum([sh.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sh.cell(row=i, column=1).value, (int, float))])
+        chi_total = sum([sh.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sh.cell(row=i, column=2).value, (int, float))])
+        remain = thu_total - chi_total
 
-        loai_text = f"💰 Nhận tiền ({loai_gd})" if is_income else f"💸 Chi tiền ({loai_gd})"
+        loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
+        
+        # Gửi thông báo đầy đủ lên Telegram
         send_telegram_notification(
             f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
             f"Nội dung: {noi_dung}\n"
             f"----------------------------------------\n"
+            f"🟢 Tổng thu: <code>{thu_total:,.0f}</code> VNĐ\n"
+            f"🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n"
+            f"💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n"
             f"✅ Đã ghi vào Excel thành công!"
         )
     except Exception as e:
-        # Gửi lỗi về Telegram để bạn biết và sửa
+        # Gửi lỗi về Telegram
         try:
             send_telegram_notification(f"❌ LỖI GHI EXCEL: \n<code>{str(e)}</code>")
         except:
             pass
         print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
+
+def send_telegram_notification(text):
+    if not TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
 
 # ================== HÀM TELEGRAM BOT ==================
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -303,11 +303,9 @@ def main():
         print("LỖI: Chưa cài đặt BOT_TOKEN!")
         sys.exit(1)
 
-    # Khởi động Flask trước (để webhook hoạt động) - use_reloader=False để tránh chạy 2 lần
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
-    # Khởi động Telegram Bot
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -315,8 +313,6 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_button))
 
     print("Bot đang chạy...")
-    
-    # Chạy Polling để lấy lệnh Telegram
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
