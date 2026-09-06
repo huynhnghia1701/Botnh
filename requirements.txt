@@ -1,0 +1,6 @@
+flask
+requests
+openpyxl
+python-telegram-bot
+pytz
+msal
