@@ -14,6 +14,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # ================== CẤU HÌNH MÔI TRƯỜNG ==================
 TOKEN = os.getenv("BOT_TOKEN")
+# MẬT KHẨU CỦA BẠN
+BOT_PASSWORD = "123123" 
 
 # Link OneDrive dạng tải về trực tiếp (dùng để ĐỌC)
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
@@ -30,6 +32,9 @@ GRAPH_AUTHORITY = "https://login.microsoftonline.com/consumers"
 GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 
 app_web = Flask(__name__)
+
+# ================== QUẢN LÝ TRẠNG THÁI ĐĂNG NHẬP ==================
+logged_in_users = {}
 
 # ================== CẤU HÌNH NGÂN HÀNG ==================
 BANKS = [
@@ -70,7 +75,6 @@ def get_excel_data():
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        # Tính tổng trực tiếp từ các ô dữ liệu (2 đến 25) để tránh lỗi đọc công thức
         thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
         chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
         remain = thu_total - chi_total
@@ -101,7 +105,6 @@ def get_excel_data():
 
 # ================== HÀM GHI EXCEL QUA GRAPH API ==================
 def get_graph_access_token():
-    """Lấy access token bằng token cache đã xin quyền từ trước."""
     if not ONEDRIVE_TOKEN_CACHE:
         raise Exception("ONEDRIVE_TOKEN_CACHE đang trống trên Render!")
 
@@ -120,7 +123,6 @@ def get_graph_access_token():
     return result["access_token"]
 
 def get_encoded_file_path():
-    """Chuẩn hóa đường dẫn file để tránh lỗi 400."""
     path = ONEDRIVE_FILE_PATH.strip().strip('/')
     if not path:
         raise Exception("ONEDRIVE_FILE_PATH đang trống trên Render!")
@@ -132,7 +134,6 @@ def get_encoded_file_path():
         return quote(path)
 
 def download_excel_for_write():
-    """Tải file Excel qua Graph API."""
     token = get_graph_access_token()
     file_path = get_encoded_file_path()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
@@ -144,7 +145,6 @@ def download_excel_for_write():
         raise Exception(f"Lỗi tải file: {str(e)}")
 
 def upload_excel(content_bytes):
-    """Ghi đè nội dung file Excel lên OneDrive."""
     token = get_graph_access_token()
     file_path = get_encoded_file_path()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
@@ -162,14 +162,11 @@ def upload_excel(content_bytes):
         raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
-    """
-    Thêm 1 giao dịch mới, dùng công thức Excel để cập nhật tổng, sau đó upload.
-    """
     content = download_excel_for_write()
     workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
     sheet = workbook.active
 
-    col = 1 if is_income else 2  # A=1 (Thu), B=2 (Chi)
+    col = 1 if is_income else 2
 
     target_row = None
     for i in range(2, 26):
@@ -181,7 +178,6 @@ def append_transaction_and_upload(amount, is_income):
 
     sheet.cell(row=target_row, column=col).value = amount
 
-    # Cập nhật công thức (đảm bảo các ô Tổng luôn đúng)
     sheet['A29'].value = '=SUM(A2:A25)'
     sheet['B29'].value = '=SUM(B2:B25)'
     sheet['A31'].value = '=A29-B29'
@@ -199,25 +195,18 @@ def sepay_webhook():
         return jsonify({"success": False, "message": "Unauthorized"}), 401
 
     data = request.get_json(force=True, silent=True) or {}
-    
-    # Trả về 200 ngay lập tức để SePay không retry
     threading.Thread(target=process_transaction, args=(data,)).start()
-    
     return jsonify({"success": True}), 200
 
 def process_transaction(data):
-    """Hàm chạy ngầm: Ghi Excel và Gửi thông báo."""
     try:
         noi_dung = data.get("content", "")
         so_tien = data.get("transferAmount", 0)
-        loai_gd = data.get("transferType")  # "in" = tiền vào, "out" = tiền ra
+        loai_gd = data.get("transferType")
         is_income = (loai_gd == "in")
 
-        # Ghi vào Excel
         append_transaction_and_upload(so_tien, is_income)
         
-        # Tính lại số liệu để gửi lên Telegram
-        # Tải lại file (vừa ghi xong) để tính tổng chính xác
         content = download_excel_for_write()
         wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         sh = wb.active
@@ -228,7 +217,6 @@ def process_transaction(data):
 
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
         
-        # Gửi thông báo đầy đủ lên Telegram
         send_telegram_notification(
             f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
             f"Nội dung: {noi_dung}\n"
@@ -239,7 +227,6 @@ def process_transaction(data):
             f"✅ Đã ghi vào Excel thành công!"
         )
     except Exception as e:
-        # Gửi lỗi về Telegram
         try:
             send_telegram_notification(f"❌ LỖI GHI EXCEL: \n<code>{str(e)}</code>")
         except:
@@ -259,20 +246,58 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng:", reply_markup=reply_markup, parse_mode="HTML")
+    
+    # Cập nhật lời chào có thêm hướng dẫn nhấn số 2 để đăng xuất
+    await update.message.reply_text(
+        "🤖 Xin chào!\n"
+        "Nhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\n"
+        "Nhập số <b>2</b> để đăng xuất.",
+        reply_markup=reply_markup, 
+        parse_mode="HTML"
+    )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_menu(update, context)
+    user_id = update.effective_user.id
+    if logged_in_users.get(user_id):
+        await show_menu(update, context)
+    else:
+        await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip() if update.message and update.message.text else ""
+
+    # Nếu chưa đăng nhập và nhập bất kỳ thứ gì (kể cả số 1) -> Kiểm tra mật khẩu
+    if not logged_in_users.get(user_id):
+        if text == BOT_PASSWORD:
+            logged_in_users[user_id] = True
+            await update.message.reply_text("✅ <b>Đăng nhập thành công!</b>", parse_mode="HTML")
+            await show_menu(update, context)
+        else:
+            await update.message.reply_text("❌ <b>Sai mật khẩu.</b> Vui lòng thử lại:", parse_mode="HTML")
+        return
+
+    # Nếu đã đăng nhập
     if text == "1":
         await show_menu(update, context)
+    elif text == "2":  # Thay /logout bằng số 2
+        logged_in_users[user_id] = False
+        await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
+    elif text.lower() == "/logout": # Vẫn giữ /logout nếu bạn muốn gõ lệnh
+        logged_in_users[user_id] = False
+        await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
     else:
         await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Kiểm tra đăng nhập trước khi cho phép bấm nút
+    if not logged_in_users.get(user_id):
+        await query.answer("Bạn chưa đăng nhập!", show_alert=True)
+        return
+
     await query.answer()
 
     if query.data == "get_qr":
