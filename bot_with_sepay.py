@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 TOKEN = os.getenv("BOT_TOKEN")
 
 # Link OneDrive dạng tải về trực tiếp (dùng để ĐỌC, giữ nguyên như cũ)
-ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIASURiHvdRqvzgy28bqT6g0s?download=1"
+ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 
 # ====== CẤU HÌNH MỚI - dùng để GHI vào OneDrive qua Graph API ======
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
