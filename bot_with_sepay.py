@@ -222,8 +222,8 @@ def process_transaction(data):
             f"Nội dung: {noi_dung}\n"
             f"----------------------------------------\n"
             f"🟢 Tổng thu: <code>{thu_total:,.0f}</code> VNĐ\n"
-            f"🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n"
-            f"💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n"
+            #f"🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n"
+            #f"💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n"
             f"✅ Đã ghi vào Excel thành công!"
         )
     except Exception as e:
