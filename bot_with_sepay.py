@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import gc
 import threading
 import time
 from datetime import datetime
@@ -67,7 +68,7 @@ BANKS = [
 # ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
-        response = requests.get(ONEDRIVE_URL, timeout=10)
+        response = requests.get(ONEDRIVE_URL, timeout=15)  # Tăng timeout lên 15s
         if response.status_code != 200:
             return f"❌ Lỗi tải file Excel từ OneDrive (Mã lỗi: {response.status_code})"
 
@@ -138,7 +139,8 @@ def download_excel_for_write():
     file_path = get_encoded_file_path()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
     try:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        # THÊM TIMEOUT TUYỆT ĐỐI
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
@@ -153,6 +155,7 @@ def upload_excel(content_bytes):
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
     try:
+        # THÊM TIMEOUT TUYỆT ĐỐI
         resp = requests.put(url, headers=headers, data=content_bytes, timeout=60)
         if resp.status_code != 200 and resp.status_code != 201:
             print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
@@ -178,7 +181,6 @@ def append_transaction_and_upload(amount, is_income):
 
     sheet.cell(row=target_row, column=col).value = amount
 
-    # Dùng Python cộng dồn (tránh lỗi công thức chưa được lưu)
     thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
     chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
     sheet['A29'].value = thu_total
@@ -189,6 +191,12 @@ def append_transaction_and_upload(amount, is_income):
     workbook.save(buf)
     buf.seek(0)
     upload_excel(buf.read())
+    
+    # GIẢI PHÓNG BỘ NHỚ ĐỂ TRÁNH BỊ RENDER KILL
+    del workbook
+    del sheet
+    del content
+    gc.collect()
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
@@ -210,7 +218,6 @@ def process_transaction(data):
 
         append_transaction_and_upload(so_tien, is_income)
         
-        # Tải lại để tính số liệu hiển thị
         content = download_excel_for_write()
         wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         sh = wb.active
@@ -230,6 +237,13 @@ def process_transaction(data):
             f"💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n"
             f"✅ Đã ghi vào Excel thành công!"
         )
+        
+        # GIẢI PHÓNG BỘ NHỚ
+        del wb
+        del sh
+        del content
+        gc.collect()
+        
     except Exception as e:
         try:
             send_telegram_notification(f"❌ LỖI GHI EXCEL: \n<code>{str(e)}</code>")
@@ -241,7 +255,10 @@ def send_telegram_notification(text):
     if not TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+    except:
+        print("Không gửi được tin nhắn Telegram, có thể do timeout.")
 
 # ================== HÀM TELEGRAM BOT ==================
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,7 +341,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== CÁC HÀM CHẠY NỀN (NGĂN BOT TỰ TẮT) ==================
 def keep_alive():
-    """Gửi log định kỳ để Render không tắt bot."""
     while True:
         time.sleep(1800) # 30 phút 1 lần
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Bot vẫn đang chạy (Keep Alive)...")
@@ -335,26 +351,30 @@ def main():
         print("LỖI: Chưa cài đặt BOT_TOKEN!")
         sys.exit(1)
 
-    # Chạy bot giữ ấm trong luồng riêng
     threading.Thread(target=keep_alive, daemon=True).start()
 
-    # Khởi động Flask (tránh conflict bằng use_reloader=False)
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
-    # Khởi động Telegram Bot
-    application = Application.builder().token(TOKEN).build()
+    # CHỐNG TREO: Dùng vòng lặp While True, nếu run_polling bị crash sẽ tự chạy lại
+    while True:
+        try:
+            application = Application.builder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(CallbackQueryHandler(handle_button))
+            application.add_handler(CommandHandler("start", start_command))
+            application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+            application.add_handler(CallbackQueryHandler(handle_button))
 
-    # Chạy bất đồng bộ (Post Init) để xóa webhook cũ trước khi Polling
-    async def post_init(app):
-        await app.bot.delete_webhook(drop_pending_updates=True)
+            async def post_init(app):
+                await app.bot.delete_webhook(drop_pending_updates=True)
 
-    print("Bot đang chạy...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=post_init)
+            print("Bot đang chạy...")
+            application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=post_init)
+        
+        except Exception as e:
+            print(f"Bot bị lỗi, đang khởi động lại sau 5 giây... Lỗi: {str(e)}")
+            time.sleep(5)
+            continue
 
 if __name__ == "__main__":
     main()
