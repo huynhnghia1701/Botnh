@@ -8,6 +8,7 @@ from datetime import datetime
 from urllib.parse import quote
 import pytz
 import requests
+import msal
 import openpyxl
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -17,11 +18,15 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
 
-# Link OneDrive dạng tải về trực tiếp (dùng để ĐỌC)
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
-
+GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
+ONEDRIVE_TOKEN_CACHE = os.getenv("ONEDRIVE_TOKEN_CACHE", "")  
+ONEDRIVE_FILE_PATH = os.getenv("ONEDRIVE_FILE_PATH", "")      
 SEPAY_API_KEY = os.getenv("SEPAY_API_KEY", "")  
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  
+
+GRAPH_AUTHORITY = "https://login.microsoftonline.com/consumers"
+GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 
 app_web = Flask(__name__)
 logged_in_users = {}
@@ -33,7 +38,7 @@ BANKS = [
     {"name": "Techcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "3838396852", "qr_url": "https://api.vietqr.io/image/970407-3838396852-compact2.jpg?accountName=HUYNH%20NGOC%20NGHIA"}
 ]
 
-# ================== HÀM ĐỌC EXCEL (TỐI ƯU NHẸ) ==================
+# ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
         response = requests.get(ONEDRIVE_URL, timeout=10)
@@ -44,7 +49,6 @@ def get_excel_data():
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        # Tính tổng bằng Python (Không phụ thuộc công thức Excel)
         thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
         chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
         remain = thu_total - chi_total
@@ -63,14 +67,96 @@ def get_excel_data():
         msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
         msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
         
-        # Giải phóng RAM ngay lập tức
         del workbook, sheet, excel_file
         gc.collect()
         return msg
+    except requests.exceptions.Timeout:
+        return "❌ Lỗi: Tải file Excel quá chậm (Timeout)."
     except Exception as e:
         return f"❌ Lỗi xử lý file Excel: {str(e)}"
 
-# ================== WEBHOOK SEPAY (CHỈ NHẬN VÀ BÁO CÁO) ==================
+# ================== HÀM GHI EXCEL (TỐI ƯU NHẸ) ==================
+def get_graph_access_token():
+    if not ONEDRIVE_TOKEN_CACHE: raise Exception("ONEDRIVE_TOKEN_CACHE đang trống!")
+    cache = msal.SerializableTokenCache()
+    cache.deserialize(ONEDRIVE_TOKEN_CACHE)
+    app = msal.PublicClientApplication(GRAPH_CLIENT_ID, authority=GRAPH_AUTHORITY, token_cache=cache)
+    accounts = app.get_accounts()
+    if not accounts: raise Exception("Token cache không có tài khoản nào!")
+    result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
+    if not result or "access_token" not in result: raise Exception("Token hết hạn!")
+    return result["access_token"]
+
+def get_encoded_file_path():
+    path = ONEDRIVE_FILE_PATH.strip().strip('/')
+    if not path: raise Exception("ONEDRIVE_FILE_PATH đang trống!")
+    if '/' in path:
+        folder, filename = path.rsplit('/', 1)
+        return f"{quote(folder)}:/{quote(filename)}"
+    return quote(path)
+
+def download_excel_for_write():
+    token = get_graph_access_token()
+    file_path = get_encoded_file_path()
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        raise Exception(f"Lỗi tải file: {str(e)}")
+
+def upload_excel(content_bytes):
+    token = get_graph_access_token()
+    file_path = get_encoded_file_path()
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    try:
+        # Timeout 30 giây để không bao giờ bị treo
+        resp = requests.put(url, headers=headers, data=content_bytes, timeout=30)
+        if resp.status_code != 200 and resp.status_code != 201:
+            print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
+            resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise Exception(f"Lỗi upload: {str(e)}")
+
+def append_transaction_and_upload(amount, is_income):
+    try:
+        content = download_excel_for_write()
+        workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
+        sheet = workbook.active
+        col = 1 if is_income else 2
+        target_row = None
+        for i in range(2, 26):
+            if sheet.cell(row=i, column=col).value is None:
+                target_row = i
+                break
+        if target_row is None: raise Exception("Hết chỗ trống!")
+        
+        # Ghi số tiền vào ô
+        sheet.cell(row=target_row, column=col).value = amount
+        
+        # Tính tổng bằng Python và ghi thẳng số (không dùng công thức để tránh lỗi đọc)
+        thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
+        chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
+        sheet['A29'].value = thu_total
+        sheet['B29'].value = chi_total
+        sheet['A31'].value = thu_total - chi_total
+        
+        buf = io.BytesIO()
+        workbook.save(buf)
+        buf.seek(0)
+        upload_excel(buf.read())
+        
+        # Giải phóng RAM ngay
+        del workbook, sheet, content, buf
+        gc.collect()
+        return True
+    except Exception as e:
+        raise Exception(f"Lỗi ghi file: {str(e)}")
+
+# ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
 def sepay_webhook():
     auth_header = request.headers.get("Authorization", "")
@@ -87,14 +173,30 @@ def process_transaction(data):
         loai_gd = data.get("transferType")
         is_income = (loai_gd == "in")
 
+        # GHI VÀO FILE EXCEL
+        try:
+            append_transaction_and_upload(so_tien, is_income)
+            ghi_thanh_cong = True
+        except Exception as e:
+            ghi_thanh_cong = False
+            print(f"❌ Lỗi ghi Excel: {str(e)}")
+
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
         
-        send_telegram_notification(
-            f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
-            f"Nội dung: {noi_dung}\n"
-            f"----------------------------------------\n"
-            f"✅ Đã nhận giao dịch!"
-        )
+        # Gửi thông báo
+        if ghi_thanh_cong:
+            send_telegram_notification(
+                f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
+                f"Nội dung: {noi_dung}\n"
+                f"----------------------------------------\n"
+                f"✅ Đã ghi vào Excel thành công!"
+            )
+        else:
+            send_telegram_notification(
+                f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
+                f"Nội dung: {noi_dung}\n"
+                f"❌ Lỗi ghi file (Kiểm tra log)"
+            )
     except Exception as e:
         print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
 
@@ -154,7 +256,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif query.data == "check_money":
         await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
-        
         def fetch_and_reply():
             try:
                 report = get_excel_data()
@@ -162,20 +263,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 asyncio.run(query.message.reply_text(report, parse_mode="HTML"))
             except Exception as e:
                 print(f"Lỗi gửi báo cáo: {e}")
-        
         threading.Thread(target=fetch_and_reply, daemon=True).start()
 
-# ================== MAIN (MỘT TIẾN TRÌNH DUY NHẤT) ==================
+# ================== MAIN ==================
 def main():
     if not TOKEN:
         print("LỖI: Chưa cài đặt BOT_TOKEN!")
         sys.exit(1)
 
-    # Chạy Flask trong 1 luồng (Thread) riêng - Nhẹ hơn nhiều so với Process
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
-    # Xóa Webhook cũ chống đứng máy
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
         print("Đã xóa webhook cũ!")
