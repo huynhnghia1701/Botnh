@@ -170,7 +170,8 @@ def process_transaction(data):
         chi_total = sum([sh.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sh.cell(row=i, column=2).value, (int, float))])
         remain = thu_total - chi_total
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
-        send_telegram_notification(f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\nNội dung: {noi_dung}\n----------------------------------------\n🟢 Tổng thu: <code>{thu_total:,.0f}</code> ###=== VNĐ\n🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n✅ Đã ghi vào Excel thành công!")
+        send_telegram_notification(f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\nNội dung: {noi_dung}\n----------------------------------------\n🟢 Tổng thu: <code>{thu_total:,.0f}</code> 
+        ###=== VNĐ\n🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n✅ Đã ghi vào Excel thành công!")#
         del wb, sh, content
         gc.collect()
     except Exception as e:
