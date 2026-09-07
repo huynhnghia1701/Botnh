@@ -2,9 +2,9 @@ import os
 import sys
 import io
 import gc
-import asyncio
 import threading
 import time
+import multiprocessing
 from datetime import datetime
 from urllib.parse import quote
 import pytz
@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# ================== CẤU HÌNH MÔI TRƯỜNG ==================
+# ================== CẤU HÌNH ==================
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
 
@@ -42,6 +42,7 @@ BANKS = [
 # ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
+        # Timeout 15 giây để không bao giờ bị treo
         response = requests.get(ONEDRIVE_URL, timeout=15)
         if response.status_code != 200:
             return f"❌ Lỗi tải file Excel từ OneDrive (Mã lỗi: {response.status_code})"
@@ -66,13 +67,19 @@ def get_excel_data():
         msg += f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total:,.0f}</code> VNĐ\n"
         msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
         msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
+        
+        # Giải phóng bộ nhớ
+        del workbook, sheet, excel_file
+        gc.collect()
         return msg
+    except requests.exceptions.Timeout:
+        return "❌ Lỗi: Tải file Excel quá chậm (Timeout 15s)."
     except Exception as e:
         return f"❌ Lỗi xử lý file Excel: {str(e)}"
 
-# ================== HÀM GHI EXCEL QUA GRAPH API ==================
+# ================== HÀM GHI EXCEL ==================
 def get_graph_access_token():
-    if not ONEDRIVE_TOKEN_CACHE: raise Exception("ONEDRIVE_TOKEN_CACHE đang trống trên Render!")
+    if not ONEDRIVE_TOKEN_CACHE: raise Exception("ONEDRIVE_TOKEN_CACHE đang trống!")
     cache = msal.SerializableTokenCache()
     cache.deserialize(ONEDRIVE_TOKEN_CACHE)
     app = msal.PublicClientApplication(GRAPH_CLIENT_ID, authority=GRAPH_AUTHORITY, token_cache=cache)
@@ -136,7 +143,7 @@ def append_transaction_and_upload(amount, is_income):
     workbook.save(buf)
     buf.seek(0)
     upload_excel(buf.read())
-    del workbook, sheet, content
+    del workbook, sheet, content, buf
     gc.collect()
 
 # ================== WEBHOOK SEPAY ==================
@@ -163,7 +170,7 @@ def process_transaction(data):
         chi_total = sum([sh.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sh.cell(row=i, column=2).value, (int, float))])
         remain = thu_total - chi_total
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
-        send_telegram_notification(f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\nNội dung: {noi_dung}\n----------------------------------------\n🟢 Tổng thu: <code>{thu_total:,.0f}</code> #VNĐ\n🔴 Tổng chi: <code>{chi_total:,.0f}</code> #VNĐ\n💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n✅ Đã ghi vào Excel thành công!")
+        send_telegram_notification(f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\nNội dung: {noi_dung}\n----------------------------------------\n🟢 Tổng thu: <code>{thu_total:,.0f}</code> VNĐ\n🔴 Tổng chi: <code>{chi_total:,.0f}</code> VNĐ\n💰 Còn lại: <code>{remain:,.0f}</code> VNĐ\n✅ Đã ghi vào Excel thành công!")
         del wb, sh, content
         gc.collect()
     except Exception as e:
@@ -212,6 +219,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Bạn chưa đăng nhập!", show_alert=True)
         return
     await query.answer()
+    
     if query.data == "get_qr":
         tz_vn = pytz.timezone('Asia/Ho_Chi_Minh')
         current_time = datetime.now(tz_vn).strftime("%d/%m/%Y %H:%M:%S")
@@ -223,59 +231,63 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_text += f"{i}. <b>{bank['name']}</b>\n   - STK: <code>{bank['account_number']}</code>\n   - Tên: <code>{bank['account_name']}</code>\n\n"
         await query.message.reply_media_group(media=media_group)
         await query.message.reply_text(info_text, parse_mode="HTML")
+        
     elif query.data == "check_money":
         await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
-        report = get_excel_data()
-        await query.message.reply_text(report, parse_mode="HTML")
+        
+        # CHẠY TRONG LUỒNG RIÊNG ĐỂ KHÔNG CHẶN BOT
+        def fetch_and_reply():
+            try:
+                report = get_excel_data()
+                # Sử dụng asyncio để gửi tin từ thread riêng
+                import asyncio
+                asyncio.run(query.message.reply_text(report, parse_mode="HTML"))
+            except Exception as e:
+                print(f"Lỗi gửi báo cáo: {e}")
+        
+        threading.Thread(target=fetch_and_reply, daemon=True).start()
 
-# ================== MAIN & ASYNC RUNNER ==================
-def keep_alive():
-    while True:
-        time.sleep(1800)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Bot vẫn đang chạy (Keep Alive)...")
+# ================== CHẠY BOT TELEGRAM RIÊNG BIỆT ==================
+def run_telegram_bot():
+    global logged_in_users
+    logged_in_users = {}
 
-async def run_bot():
+    # Xóa Webhook cũ chống đứng máy
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+        print("Đã xóa webhook cũ!")
+    except:
+        pass
+
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    
-    # Chạy bot và nếu nó crash vì lý do nào đó sẽ tự thử lại sau 5 giây
-    while True:
-        try:
-            print("Bot đang chạy...")
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            # Giữ cho bot chạy mãi mãi
-            while True:
-                await asyncio.sleep(3600)
-        except Exception as e:
-            print(f"Bot gặp lỗi, tự khởi động lại sau 5 giây... Lỗi: {e}")
-            await asyncio.sleep(5)
-            
-            # Khởi tạo lại instance vì instance cũ đã hỏng
-            application = Application.builder().token(TOKEN).build()
-            application.add_handler(CommandHandler("start", start_command))
-            application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-            application.add_handler(CallbackQueryHandler(handle_button))
-            await application.bot.delete_webhook(drop_pending_updates=True)
 
+    print("Bot Telegram đang chạy độc lập...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ================== CHẠY FLASK (WEBHOOK SEPAY) RIÊNG BIỆT ==================
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Flask (Webhook) đang chạy trên cổng {port}...")
+    app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# ================== MAIN ==================
 def main():
     if not TOKEN:
         print("LỖI: Chưa cài đặt BOT_TOKEN!")
         sys.exit(1)
 
-    # Chạy Flask (Webhook) trong luồng riêng
-    port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
-    
-    # Chạy Keep Alive
-    threading.Thread(target=keep_alive, daemon=True).start()
+    # Tách 2 tiến trình riêng biệt để không bao giờ xung đột
+    flask_process = multiprocessing.Process(target=run_flask)
+    telegram_process = multiprocessing.Process(target=run_telegram_bot)
 
-    # Chạy Bot Telegram trong Asyncio (chống treo và tự restart)
-    asyncio.run(run_bot())
+    flask_process.start()
+    telegram_process.start()
+
+    flask_process.join()
+    telegram_process.join()
 
 if __name__ == "__main__":
     main()
