@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import gc
+import asyncio
 import threading
 import time
 from datetime import datetime
@@ -112,7 +113,6 @@ def upload_excel(content_bytes):
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
     try:
-        # Timeout 30 giây để không bao giờ bị treo
         resp = requests.put(url, headers=headers, data=content_bytes, timeout=30)
         if resp.status_code != 200 and resp.status_code != 201:
             print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
@@ -134,10 +134,8 @@ def append_transaction_and_upload(amount, is_income):
                 break
         if target_row is None: raise Exception("Hết chỗ trống!")
         
-        # Ghi số tiền vào ô
         sheet.cell(row=target_row, column=col).value = amount
         
-        # Tính tổng bằng Python và ghi thẳng số (không dùng công thức để tránh lỗi đọc)
         thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
         chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
         sheet['A29'].value = thu_total
@@ -149,7 +147,6 @@ def append_transaction_and_upload(amount, is_income):
         buf.seek(0)
         upload_excel(buf.read())
         
-        # Giải phóng RAM ngay
         del workbook, sheet, content, buf
         gc.collect()
         return True
@@ -173,7 +170,6 @@ def process_transaction(data):
         loai_gd = data.get("transferType")
         is_income = (loai_gd == "in")
 
-        # GHI VÀO FILE EXCEL
         try:
             append_transaction_and_upload(so_tien, is_income)
             ghi_thanh_cong = True
@@ -183,7 +179,6 @@ def process_transaction(data):
 
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
         
-        # Gửi thông báo
         if ghi_thanh_cong:
             send_telegram_notification(
                 f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
@@ -256,14 +251,14 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif query.data == "check_money":
         await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
-        def fetch_and_reply():
-            try:
-                report = get_excel_data()
-                import asyncio
-                asyncio.run(query.message.reply_text(report, parse_mode="HTML"))
-            except Exception as e:
-                print(f"Lỗi gửi báo cáo: {e}")
-        threading.Thread(target=fetch_and_reply, daemon=True).start()
+        try:
+            # SỬA LỖI TREO: chạy hàm blocking trong thread pool nhưng
+            # VẪN Ở TRONG event loop hiện tại (không tạo asyncio.run() ở thread khác
+            # -> tránh deadlock khi gọi API Telegram từ 2 event loop khác nhau)
+            report = await asyncio.to_thread(get_excel_data)
+            await query.message.reply_text(report, parse_mode="HTML")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Lỗi lấy dữ liệu: {e}")
 
 # ================== MAIN ==================
 def main():
@@ -280,7 +275,9 @@ def main():
     except:
         pass
 
-    application = Application.builder().token(TOKEN).build()
+    # concurrent_updates=True: cho phép xử lý nhiều tin nhắn/nút bấm CÙNG LÚC,
+    # để 1 request chậm (vd tải Excel) không làm "treo" toàn bộ bot với người khác
+    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
