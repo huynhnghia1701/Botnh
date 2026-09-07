@@ -68,7 +68,7 @@ BANKS = [
 # ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
-        response = requests.get(ONEDRIVE_URL, timeout=15)  # Tăng timeout lên 15s
+        response = requests.get(ONEDRIVE_URL, timeout=15)
         if response.status_code != 200:
             return f"❌ Lỗi tải file Excel từ OneDrive (Mã lỗi: {response.status_code})"
 
@@ -139,7 +139,6 @@ def download_excel_for_write():
     file_path = get_encoded_file_path()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
     try:
-        # THÊM TIMEOUT TUYỆT ĐỐI
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         resp.raise_for_status()
         return resp.content
@@ -155,7 +154,6 @@ def upload_excel(content_bytes):
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
     try:
-        # THÊM TIMEOUT TUYỆT ĐỐI
         resp = requests.put(url, headers=headers, data=content_bytes, timeout=60)
         if resp.status_code != 200 and resp.status_code != 201:
             print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
@@ -192,7 +190,6 @@ def append_transaction_and_upload(amount, is_income):
     buf.seek(0)
     upload_excel(buf.read())
     
-    # GIẢI PHÓNG BỘ NHỚ ĐỂ TRÁNH BỊ RENDER KILL
     del workbook
     del sheet
     del content
@@ -238,7 +235,6 @@ def process_transaction(data):
             f"✅ Đã ghi vào Excel thành công!"
         )
         
-        # GIẢI PHÓNG BỘ NHỚ
         del wb
         del sh
         del content
@@ -339,12 +335,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_excel_data()
         await query.message.reply_text(report, parse_mode="HTML")
 
-# ================== CÁC HÀM CHẠY NỀN (NGĂN BOT TỰ TẮT) ==================
-def keep_alive():
-    while True:
-        time.sleep(1800) # 30 phút 1 lần
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Bot vẫn đang chạy (Keep Alive)...")
-
 # ================== MAIN ==================
 def main():
     if not TOKEN:
@@ -356,25 +346,22 @@ def main():
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
-    # CHỐNG TREO: Dùng vòng lặp While True, nếu run_polling bị crash sẽ tự chạy lại
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(CallbackQueryHandler(handle_button))
+
+    async def post_init(app):
+        await app.bot.delete_webhook(drop_pending_updates=True)
+
+    print("Bot đang chạy...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=post_init)
+
+def keep_alive():
     while True:
-        try:
-            application = Application.builder().token(TOKEN).build()
-
-            application.add_handler(CommandHandler("start", start_command))
-            application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-            application.add_handler(CallbackQueryHandler(handle_button))
-
-            async def post_init(app):
-                await app.bot.delete_webhook(drop_pending_updates=True)
-
-            print("Bot đang chạy...")
-            application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=post_init)
-        
-        except Exception as e:
-            print(f"Bot bị lỗi, đang khởi động lại sau 5 giây... Lỗi: {str(e)}")
-            time.sleep(5)
-            continue
+        time.sleep(1800)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Bot vẫn đang chạy (Keep Alive)...")
 
 if __name__ == "__main__":
-    main()#
+    main()
