@@ -43,11 +43,10 @@ BANKS = [
 # ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
-        response = requests.get(ONEDRIVE_URL, timeout=10)
-        if response.status_code != 200:
-            return f"❌ Lỗi tải file Excel từ OneDrive (Mã lỗi: {response.status_code})"
-        
-        excel_file = io.BytesIO(response.content)
+        # Đọc CÙNG 1 FILE với chỗ ghi (qua Graph API + ONEDRIVE_FILE_PATH),
+        # KHÔNG dùng link chia sẻ ONEDRIVE_URL cũ nữa (có thể trỏ nhầm file/bản khác)
+        content = download_excel_for_write()
+        excel_file = io.BytesIO(content)
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
