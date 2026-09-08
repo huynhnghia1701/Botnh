@@ -51,15 +51,12 @@ def get_excel_data():
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật.
-        # Đọc thẳng A29/B29/A31 (đã có công thức SUM sẵn trong file) thay vì tự cộng lại,
-        # để luôn khớp chính xác với những gì hiển thị khi mở Excel.
-        thu_total = sheet['A29'].value or 0
-        chi_total = sheet['B29'].value or 0
-        remain = sheet['A31'].value or (thu_total - chi_total if isinstance(thu_total, (int, float)) and isinstance(chi_total, (int, float)) else 0)
+        thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
+        chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
+        remain = thu_total - chi_total
 
-        thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 28) if sheet.cell(row=i, column=1).value is not None]
-        chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 28) if sheet.cell(row=i, column=2).value is not None]
+        thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 26) if sheet.cell(row=i, column=1).value is not None]
+        chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 26) if sheet.cell(row=i, column=2).value is not None]
 
         msg = "📊 <b>BÁO CÁO SỔ THU CHI (ONEDRIVE)</b>\n----------------------------------------\n📥 <b>DANH SÁCH THU:</b>\n"
         for val in thu_list:
@@ -135,18 +132,20 @@ def append_transaction_and_upload(amount, is_income):
             workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
             sheet = workbook.active
             col = 1 if is_income else 2
-            # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật
             target_row = None
-            for i in range(2, 28):
+            for i in range(2, 26):
                 if sheet.cell(row=i, column=col).value is None:
                     target_row = i
                     break
-            if target_row is None: raise Exception("Hết chỗ trống trong bảng (đủ 26 dòng)! Cần dọn bớt Excel.")
+            if target_row is None: raise Exception("Hết chỗ trống trong bảng (đủ 24 dòng)! Cần dọn bớt Excel.")
 
-            # CHỈ ghi số tiền giao dịch mới vào ô trống.
-            # KHÔNG đụng tới A29/B29/A31 -> giữ nguyên công thức SUM có sẵn,
-            # Excel sẽ tự tính lại đúng khi bạn mở file lên xem.
             sheet.cell(row=target_row, column=col).value = amount
+
+            thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
+            chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
+            sheet['A29'].value = thu_total
+            sheet['B29'].value = chi_total
+            sheet['A31'].value = thu_total - chi_total
 
             buf = io.BytesIO()
             workbook.save(buf)
