@@ -31,6 +31,7 @@ GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 
 app_web = Flask(__name__)
 logged_in_users = {}
+excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
 
 BANKS = [
     {"name": "Vietcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "96886693059121", "qr_url": "https://api.vietqr.io/image/MSB-96886693059121-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
@@ -122,36 +123,42 @@ def upload_excel(content_bytes):
         raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
-    try:
-        content = download_excel_for_write()
-        workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
-        sheet = workbook.active
-        col = 1 if is_income else 2
-        target_row = None
-        for i in range(2, 26):
-            if sheet.cell(row=i, column=col).value is None:
-                target_row = i
-                break
-        if target_row is None: raise Exception("Hết chỗ trống!")
-        
-        sheet.cell(row=target_row, column=col).value = amount
-        
-        thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
-        chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
-        sheet['A29'].value = thu_total
-        sheet['B29'].value = chi_total
-        sheet['A31'].value = thu_total - chi_total
-        
-        buf = io.BytesIO()
-        workbook.save(buf)
-        buf.seek(0)
-        upload_excel(buf.read())
-        
-        del workbook, sheet, content, buf
-        gc.collect()
-        return True
-    except Exception as e:
-        raise Exception(f"Lỗi ghi file: {str(e)}")
+    # Khóa lại: nếu 2 giao dịch SePay đến gần nhau cùng lúc, giao dịch thứ 2
+    # phải CHỜ giao dịch thứ 1 ghi + upload xong hẳn mới được bắt đầu.
+    # Tránh trường hợp cả 2 cùng tải bản cũ -> cùng ghi -> cái ghi sau đè mất cái ghi trước.
+    with excel_write_lock:
+        try:
+            content = download_excel_for_write()
+            workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
+            sheet = workbook.active
+            col = 1 if is_income else 2
+            target_row = None
+            for i in range(2, 26):
+                if sheet.cell(row=i, column=col).value is None:
+                    target_row = i
+                    break
+            if target_row is None: raise Exception("Hết chỗ trống trong bảng (đủ 24 dòng)! Cần dọn bớt Excel.")
+
+            sheet.cell(row=target_row, column=col).value = amount
+
+            thu_total = sum([sheet.cell(row=i, column=1).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=1).value, (int, float))])
+            chi_total = sum([sheet.cell(row=i, column=2).value or 0 for i in range(2, 26) if isinstance(sheet.cell(row=i, column=2).value, (int, float))])
+            sheet['A29'].value = thu_total
+            sheet['B29'].value = chi_total
+            sheet['A31'].value = thu_total - chi_total
+
+            buf = io.BytesIO()
+            workbook.save(buf)
+            buf.seek(0)
+            upload_excel(buf.read())
+
+            del workbook, sheet, content, buf
+            gc.collect()
+            return True
+        except Exception as e:
+            # Ném lại lỗi NGUYÊN VĂN (không bọc thêm "Lỗi ghi file:") để
+            # tin nhắn Telegram hiển thị đúng chi tiết lỗi gốc, dễ debug hơn.
+            raise
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
@@ -170,12 +177,14 @@ def process_transaction(data):
         loai_gd = data.get("transferType")
         is_income = (loai_gd == "in")
 
+        loi_chi_tiet = ""
         try:
             append_transaction_and_upload(so_tien, is_income)
             ghi_thanh_cong = True
         except Exception as e:
             ghi_thanh_cong = False
-            print(f"❌ Lỗi ghi Excel: {str(e)}")
+            loi_chi_tiet = str(e)
+            print(f"❌ Lỗi ghi Excel: {loi_chi_tiet}")
 
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
         
@@ -190,7 +199,7 @@ def process_transaction(data):
             send_telegram_notification(
                 f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
                 f"Nội dung: {noi_dung}\n"
-                f"❌ Lỗi ghi file (Kiểm tra log)"
+                f"❌ Lỗi ghi file:\n<code>{loi_chi_tiet}</code>"
             )
     except Exception as e:
         print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
