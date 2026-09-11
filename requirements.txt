@@ -4,3 +4,4 @@ openpyxl
 python-telegram-bot
 pytz
 msal
+easyocr
