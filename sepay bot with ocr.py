@@ -19,6 +19,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 #
 # ================== CẤU HÌNH ==================
+#
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
 
