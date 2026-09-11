@@ -2,7 +2,6 @@ import os
 import sys
 import io
 import gc
-import re
 import asyncio
 import threading
 import time
@@ -12,8 +11,6 @@ import pytz
 import requests
 import msal
 import openpyxl
-from PIL import Image
-import pytesseract
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -34,7 +31,7 @@ GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 
 app_web = Flask(__name__)
 logged_in_users = {}
-excel_write_lock = threading.Lock()  # Đảm bảo chỉ 1 thread ghi Excel tại 1 thời điểm
+excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
 
 BANKS = [
     {"name": "Vietcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "96886693059121", "qr_url": "https://api.vietqr.io/image/MSB-96886693059121-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
@@ -43,16 +40,20 @@ BANKS = [
     {"name": "Techcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "3838396852", "qr_url": "https://api.vietqr.io/image/970407-3838396852-compact2.jpg?accountName=HUYNH%20NGOC%20NGHIA"}
 ]
 
-# ================== HÀM ĐỌC EXCEL (TỐI ƯU RAM) ==================
+# ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
-    excel_file = None
-    workbook = None
     try:
+        # Đọc CÙNG 1 FILE với chỗ ghi (qua Graph API + ONEDRIVE_FILE_PATH),
+        # KHÔNG dùng link chia sẻ ONEDRIVE_URL cũ nữa (có thể trỏ nhầm file/bản khác)
         content = download_excel_for_write()
         excel_file = io.BytesIO(content)
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
+        # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật.
+        # Tự cộng bằng Python từ dữ liệu THẬT (không đọc A29/B29/A31) để luôn
+        # đúng ngay lập tức, không phụ thuộc việc file có được mở lại bằng Excel
+        # để tính lại công thức hay chưa.
         thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 28) if sheet.cell(row=i, column=1).value is not None]
         chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 28) if sheet.cell(row=i, column=2).value is not None]
         thu_total = sum(v for v in thu_list if isinstance(v, (int, float)))
@@ -70,19 +71,15 @@ def get_excel_data():
         msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
         msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
         
+        del workbook, sheet, excel_file
+        gc.collect()
         return msg
     except requests.exceptions.Timeout:
         return "❌ Lỗi: Tải file Excel quá chậm (Timeout)."
     except Exception as e:
         return f"❌ Lỗi xử lý file Excel: {str(e)}"
-    finally:
-        # Giải phóng bộ nhớ RAM triệt để
-        if workbook: workbook.close()
-        if excel_file: excel_file.close()
-        del content, excel_file, workbook
-        gc.collect()
 
-# ================== HÀM GHI EXCEL (GRAPH API) ==================
+# ================== HÀM GHI EXCEL (TỐI ƯU NHẸ) ==================
 def get_graph_access_token():
     if not ONEDRIVE_TOKEN_CACHE: raise Exception("ONEDRIVE_TOKEN_CACHE đang trống!")
     cache = msal.SerializableTokenCache()
@@ -120,7 +117,7 @@ def upload_excel(content_bytes):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
     try:
         resp = requests.put(url, headers=headers, data=content_bytes, timeout=30)
-        if resp.status_code not in (200, 201):
+        if resp.status_code != 200 and resp.status_code != 201:
             print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
             resp.raise_for_status()
         return resp.json()
@@ -128,15 +125,16 @@ def upload_excel(content_bytes):
         raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
+    # Khóa lại: nếu 2 giao dịch SePay đến gần nhau cùng lúc, giao dịch thứ 2
+    # phải CHỜ giao dịch thứ 1 ghi + upload xong hẳn mới được bắt đầu.
+    # Tránh trường hợp cả 2 cùng tải bản cũ -> cùng ghi -> cái ghi sau đè mất cái ghi trước.
     with excel_write_lock:
-        workbook = None
-        buf = None
         try:
             content = download_excel_for_write()
             workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
             sheet = workbook.active
             col = 1 if is_income else 2
-            
+            # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật
             target_row = None
             for i in range(2, 28):
                 if sheet.cell(row=i, column=col).value is None:
@@ -144,6 +142,9 @@ def append_transaction_and_upload(amount, is_income):
                     break
             if target_row is None: raise Exception("Hết chỗ trống trong bảng (đủ 26 dòng)! Cần dọn bớt Excel.")
 
+            # CHỈ ghi số tiền giao dịch mới vào ô trống.
+            # KHÔNG đụng tới A29/B29/A31 -> giữ nguyên công thức SUM có sẵn,
+            # Excel sẽ tự tính lại đúng khi bạn mở file lên xem.
             sheet.cell(row=target_row, column=col).value = amount
 
             buf = io.BytesIO()
@@ -151,48 +152,13 @@ def append_transaction_and_upload(amount, is_income):
             buf.seek(0)
             upload_excel(buf.read())
 
-            return True, target_row
-        finally:
-            if workbook: workbook.close()
-            if buf: buf.close()
-            del content, buf, workbook
+            del workbook, sheet, content, buf
             gc.collect()
-
-# ================== HÀM XỬ LÝ OCR (CỰC NHẸ RAM) ==================
-def process_receipt_image(image_bytes):
-    img = None
-    try:
-        # Sử dụng PIL + Pytesseract siêu nhẹ
-        img = Image.open(io.BytesIO(image_bytes))
-        full_text = pytesseract.image_to_string(img)
-
-        # Tìm các chuỗi số tiền
-        found_numbers = re.findall(r'\b\d{1,3}(?:[.,]\d{3})+\b|\b\d{4,9}\b', full_text)
-
-        if not found_numbers:
-            return False, "❌ Không nhận diện được chuỗi số tiền hợp lệ trên ảnh bill."
-
-        parsed_amounts = []
-        for num in found_numbers:
-            clean_num = int(re.sub(r'[.,]', '', num))
-            if 1000 <= clean_num <= 500000000:
-                parsed_amounts.append(clean_num)
-
-        if not parsed_amounts:
-            return False, "❌ Các giá trị số đọc được không phải số tiền hợp lệ."
-
-        extracted_amount = max(parsed_amounts)
-
-        # Ghi khoản CHI vào OneDrive
-        _, row_idx = append_transaction_and_upload(extracted_amount, is_income=False)
-        return True, f"💸 **ĐÃ THÊM KHOẢN CHI THÀNH CÔNG!**\n----------------------------------------\n🔹 Số tiền: <code>{extracted_amount:,.0f}</code> VNĐ\n📍 Vị trí: Cột CHI (Dòng {row_idx})\n☁️ Đã đồng bộ lên OneDrive."
-
-    except Exception as e:
-        return False, f"❌ Lỗi ghi file OneDrive: {str(e)}"
-    finally:
-        if img: img.close()
-        del image_bytes, img
-        gc.collect()
+            return True
+        except Exception as e:
+            # Ném lại lỗi NGUYÊN VĂN (không bọc thêm "Lỗi ghi file:") để
+            # tin nhắn Telegram hiển thị đúng chi tiết lỗi gốc, dễ debug hơn.
+            raise
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
@@ -218,6 +184,7 @@ def process_transaction(data):
         except Exception as e:
             ghi_thanh_cong = False
             loi_chi_tiet = str(e)
+            print(f"❌ Lỗi ghi Excel: {loi_chi_tiet}")
 
         loai_text = f"💰 Nhận tiền (in)" if is_income else f"💸 Chi tiền (out)"
         
@@ -236,44 +203,23 @@ def process_transaction(data):
             )
     except Exception as e:
         print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
-    finally:
-        gc.collect()
 
 def send_telegram_notification(text):
     if not TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    except: pass
+    except: print("Không gửi được tin nhắn Telegram.")
 
 # ================== HÀM TELEGRAM BOT ==================
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")], [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n📷 <i>Gửi ảnh bill chuyển khoản để tự động ghi khoản Chi!</i>", reply_markup=reply_markup, parse_mode="HTML")
+    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.", reply_markup=reply_markup, parse_mode="HTML")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if logged_in_users.get(user_id): await show_menu(update, context)
     else: await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not logged_in_users.get(user_id):
-        await update.message.reply_text("🔒 Vui lòng đăng nhập trước khi gửi ảnh bill!")
-        return
-
-    msg = await update.message.reply_text("🔍 Bot đang quét dữ liệu số tiền từ bill và cập nhật lên OneDrive...")
-    
-    try:
-        photo_file = await update.message.photo[-1].get_file()
-        image_bytes = await photo_file.download_as_bytearray()
-
-        success, response_msg = await asyncio.to_thread(process_receipt_image, bytes(image_bytes))
-        await msg.edit_text(response_msg, parse_mode="HTML")
-    except Exception as e:
-        await msg.edit_text(f"❌ Có lỗi trong quá trình xử lý ảnh: {str(e)}")
-    finally:
-        gc.collect()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -290,7 +236,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "2":
         logged_in_users[user_id] = False
         await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
-    else: await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1 hoặc gửi ảnh bill để ghi khoản Chi.")
+    else: await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -315,6 +261,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "check_money":
         await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
         try:
+            # SỬA LỖI TREO: chạy hàm blocking trong thread pool nhưng
+            # VẪN Ở TRONG event loop hiện tại (không tạo asyncio.run() ở thread khác
+            # -> tránh deadlock khi gọi API Telegram từ 2 event loop khác nhau)
             report = await asyncio.to_thread(get_excel_data)
             await query.message.reply_text(report, parse_mode="HTML")
         except Exception as e:
@@ -332,11 +281,13 @@ def main():
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
         print("Đã xóa webhook cũ!")
-    except: pass
+    except:
+        pass
 
+    # concurrent_updates=True: cho phép xử lý nhiều tin nhắn/nút bấm CÙNG LÚC,
+    # để 1 request chậm (vd tải Excel) không làm "treo" toàn bộ bot với người khác
     application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
 
