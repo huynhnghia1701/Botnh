@@ -4,5 +4,3 @@ openpyxl
 msal
 pytz
 python-telegram-bot
-Pillow
-pytesseract
