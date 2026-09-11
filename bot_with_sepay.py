@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import gc
+import re
 import asyncio
 import threading
 import time
@@ -11,6 +12,7 @@ import pytz
 import requests
 import msal
 import openpyxl
+import easyocr
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -33,6 +35,10 @@ app_web = Flask(__name__)
 logged_in_users = {}
 excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
 
+# Khởi tạo EasyOCR (Đọc tiếng Việt và tiếng Anh trên Bill)
+# gpu=False phù hợp chạy trên môi trường Server/Container (như Render, Heroku)
+reader = easyocr.Reader(['vi', 'en'], gpu=False)
+
 BANKS = [
     {"name": "Vietcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "96886693059121", "qr_url": "https://api.vietqr.io/image/MSB-96886693059121-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
     {"name": "OCB (Phương Đông)", "account_name": "HUYNH NGOC NGHIA", "account_number": "OCB-SEPHN48935", "qr_url": "https://api.vietqr.io/image/OCB-SEPHN48935-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
@@ -43,17 +49,11 @@ BANKS = [
 # ================== HÀM ĐỌC EXCEL ==================
 def get_excel_data():
     try:
-        # Đọc CÙNG 1 FILE với chỗ ghi (qua Graph API + ONEDRIVE_FILE_PATH),
-        # KHÔNG dùng link chia sẻ ONEDRIVE_URL cũ nữa (có thể trỏ nhầm file/bản khác)
         content = download_excel_for_write()
         excel_file = io.BytesIO(content)
         workbook = openpyxl.load_workbook(excel_file, data_only=True)
         sheet = workbook.active
 
-        # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật.
-        # Tự cộng bằng Python từ dữ liệu THẬT (không đọc A29/B29/A31) để luôn
-        # đúng ngay lập tức, không phụ thuộc việc file có được mở lại bằng Excel
-        # để tính lại công thức hay chưa.
         thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 28) if sheet.cell(row=i, column=1).value is not None]
         chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 28) if sheet.cell(row=i, column=2).value is not None]
         thu_total = sum(v for v in thu_list if isinstance(v, (int, float)))
@@ -79,7 +79,7 @@ def get_excel_data():
     except Exception as e:
         return f"❌ Lỗi xử lý file Excel: {str(e)}"
 
-# ================== HÀM GHI EXCEL (TỐI ƯU NHẸ) ==================
+# ================== HÀM GHI EXCEL (GRAPH API) ==================
 def get_graph_access_token():
     if not ONEDRIVE_TOKEN_CACHE: raise Exception("ONEDRIVE_TOKEN_CACHE đang trống!")
     cache = msal.SerializableTokenCache()
@@ -125,16 +125,13 @@ def upload_excel(content_bytes):
         raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
-    # Khóa lại: nếu 2 giao dịch SePay đến gần nhau cùng lúc, giao dịch thứ 2
-    # phải CHỜ giao dịch thứ 1 ghi + upload xong hẳn mới được bắt đầu.
-    # Tránh trường hợp cả 2 cùng tải bản cũ -> cùng ghi -> cái ghi sau đè mất cái ghi trước.
     with excel_write_lock:
         try:
             content = download_excel_for_write()
             workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
             sheet = workbook.active
             col = 1 if is_income else 2
-            # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật
+            
             target_row = None
             for i in range(2, 28):
                 if sheet.cell(row=i, column=col).value is None:
@@ -142,9 +139,6 @@ def append_transaction_and_upload(amount, is_income):
                     break
             if target_row is None: raise Exception("Hết chỗ trống trong bảng (đủ 26 dòng)! Cần dọn bớt Excel.")
 
-            # CHỈ ghi số tiền giao dịch mới vào ô trống.
-            # KHÔNG đụng tới A29/B29/A31 -> giữ nguyên công thức SUM có sẵn,
-            # Excel sẽ tự tính lại đúng khi bạn mở file lên xem.
             sheet.cell(row=target_row, column=col).value = amount
 
             buf = io.BytesIO()
@@ -154,11 +148,42 @@ def append_transaction_and_upload(amount, is_income):
 
             del workbook, sheet, content, buf
             gc.collect()
-            return True
+            return True, target_row
         except Exception as e:
-            # Ném lại lỗi NGUYÊN VĂN (không bọc thêm "Lỗi ghi file:") để
-            # tin nhắn Telegram hiển thị đúng chi tiết lỗi gốc, dễ debug hơn.
             raise
+
+# ================== HÀM XỬ LÝ OCR ẢNH BILL ==================
+def process_receipt_image(image_bytes):
+    try:
+        # Nhận diện chữ trong file ảnh (tải từ RAM)
+        results = reader.readtext(image_bytes, detail=0)
+        full_text = " ".join(results)
+
+        # Lọc tìm tất cả các chuỗi định dạng số tiền
+        found_numbers = re.findall(r'\b\d{1,3}(?:[.,]\d{3})+\b|\b\d{4,9}\b', full_text)
+
+        if not found_numbers:
+            return False, "❌ Không nhận diện được chuỗi số tiền hợp lệ trên ảnh bill."
+
+        parsed_amounts = []
+        for num in found_numbers:
+            clean_num = int(re.sub(r'[.,]', '', num))
+            # Lọc các số tiền nằm trong ngưỡng giao dịch thực tế (1,000 đến 500,000,000 VNĐ)
+            if 1000 <= clean_num <= 500000000:
+                parsed_amounts.append(clean_num)
+
+        if not parsed_amounts:
+            return False, "❌ Các giá trị số đọc được trên ảnh không nằm trong khoảng số tiền hợp lệ."
+
+        # Lấy giá trị lớn nhất trong các chuỗi số lọc được (thường là số tiền thanh toán tổng)
+        extracted_amount = max(parsed_amounts)
+
+        # Tiến hành ghi vào Cột CHI (is_income = False) và Upload lên OneDrive
+        _, row_idx = append_transaction_and_upload(extracted_amount, is_income=False)
+        return True, f"💸 **ĐÃ THÊM KHOẢN CHI THÀNH CÔNG!**\n----------------------------------------\n🔹 Số tiền: <code>{extracted_amount:,.0f}</code> VNĐ\n📍 Vị trí: Cột CHI (Dòng {row_idx})\n☁️ Đã đồng bộ lên OneDrive."
+
+    except Exception as e:
+        return False, f"❌ Lỗi ghi file OneDrive: {str(e)}"
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/sepay-webhook', methods=['POST'])
@@ -214,12 +239,32 @@ def send_telegram_notification(text):
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")], [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.", reply_markup=reply_markup, parse_mode="HTML")
+    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n📷 <i>Gửi ảnh bill chuyển khoản để tự động ghi khoản Chi!</i>", reply_markup=reply_markup, parse_mode="HTML")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if logged_in_users.get(user_id): await show_menu(update, context)
     else: await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not logged_in_users.get(user_id):
+        await update.message.reply_text("🔒 Vui lòng đăng nhập trước khi gửi ảnh bill!")
+        return
+
+    msg = await update.message.reply_text("🔍 Bot đang quét dữ liệu số tiền từ bill và cập nhật lên OneDrive...")
+    
+    try:
+        # Tải ảnh về dưới dạng byte stream
+        photo_file = await update.message.photo[-1].get_file()
+        image_bytes = await photo_file.download_as_bytearray()
+
+        # Đưa vào thread pool để không làm nghẽn Event Loop chính
+        success, response_msg = await asyncio.to_thread(process_receipt_image, bytes(image_bytes))
+        
+        await msg.edit_text(response_msg, parse_mode="HTML")
+    except Exception as e:
+        await msg.edit_text(f"❌ Có lỗi trong quá trình xử lý ảnh: {str(e)}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -236,7 +281,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "2":
         logged_in_users[user_id] = False
         await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
-    else: await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1")
+    else: await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1 hoặc gửi ảnh bill để ghi khoản Chi.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -261,9 +306,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "check_money":
         await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
         try:
-            # SỬA LỖI TREO: chạy hàm blocking trong thread pool nhưng
-            # VẪN Ở TRONG event loop hiện tại (không tạo asyncio.run() ở thread khác
-            # -> tránh deadlock khi gọi API Telegram từ 2 event loop khác nhau)
             report = await asyncio.to_thread(get_excel_data)
             await query.message.reply_text(report, parse_mode="HTML")
         except Exception as e:
@@ -284,10 +326,9 @@ def main():
     except:
         pass
 
-    # concurrent_updates=True: cho phép xử lý nhiều tin nhắn/nút bấm CÙNG LÚC,
-    # để 1 request chậm (vd tải Excel) không làm "treo" toàn bộ bot với người khác
     application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))  # Xử lý nhận ảnh hóa đơn
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
 
