@@ -161,6 +161,10 @@ def append_transaction_and_upload(amount, is_income):
             raise
 
 # ================== WEBHOOK SEPAY ==================
+@app_web.route('/ping', methods=['GET'])
+def ping():
+    return "OK", 200
+
 @app_web.route('/sepay-webhook', methods=['POST'])
 def sepay_webhook():
     auth_header = request.headers.get("Authorization", "")
