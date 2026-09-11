@@ -51,14 +51,14 @@ def get_excel_data():
         sheet = workbook.active
 
         # Dữ liệu nằm ở dòng 2-27 (26 dòng), khớp đúng file Excel thật.
-        # Đọc thẳng A29/B29/A31 (đã có công thức SUM sẵn trong file) thay vì tự cộng lại,
-        # để luôn khớp chính xác với những gì hiển thị khi mở Excel.
-        thu_total = sheet['A29'].value or 0
-        chi_total = sheet['B29'].value or 0
-        remain = sheet['A31'].value or (thu_total - chi_total if isinstance(thu_total, (int, float)) and isinstance(chi_total, (int, float)) else 0)
-
+        # Tự cộng bằng Python từ dữ liệu THẬT (không đọc A29/B29/A31) để luôn
+        # đúng ngay lập tức, không phụ thuộc việc file có được mở lại bằng Excel
+        # để tính lại công thức hay chưa.
         thu_list = [sheet.cell(row=i, column=1).value for i in range(2, 28) if sheet.cell(row=i, column=1).value is not None]
         chi_list = [sheet.cell(row=i, column=2).value for i in range(2, 28) if sheet.cell(row=i, column=2).value is not None]
+        thu_total = sum(v for v in thu_list if isinstance(v, (int, float)))
+        chi_total = sum(v for v in chi_list if isinstance(v, (int, float)))
+        remain = thu_total - chi_total
 
         msg = "📊 <b>BÁO CÁO SỔ THU CHI (ONEDRIVE)</b>\n----------------------------------------\n📥 <b>DANH SÁCH THU:</b>\n"
         for val in thu_list:
