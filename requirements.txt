@@ -1,7 +1,8 @@
-flask
+Flask
 requests
 openpyxl
-python-telegram-bot
-pytz
 msal
-easyocr
+pytz
+python-telegram-bot
+Pillow
+pytesseract
