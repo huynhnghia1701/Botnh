@@ -19,6 +19,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== CẤU HÌNH ==================
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
+EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "456456")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
 
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
@@ -32,6 +33,8 @@ GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 
 app_web = Flask(__name__)
 logged_in_users = {}
+awaiting_expense_password = set()  # user_id đang chờ nhập mật khẩu riêng để mở khóa ghi sổ chi
+expense_mode_users = set()  # user_id đã mở khóa, được phép gõ số tiền để ghi sổ chi
 excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
 
 # Regex nhận diện tin nhắn là một số tiền, ví dụ: "-2.550.000", "2.550.000", "+150000", "50k"
@@ -330,12 +333,15 @@ def background_retry_write(amount, is_income, chat_id, message_id, attempt=1, ma
 
 # ================== HÀM TELEGRAM BOT ==================
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")], [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")]]
+    keyboard = [
+        [InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")],
+        [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")],
+        [InlineKeyboardButton("📝 Ghi sổ chi", callback_data="add_expense")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n\n"
-        "💡 Bạn cũng có thể gõ thẳng số tiền để ghi khoản <b>chi</b>, ví dụ:\n"
-        "  • <code>2.550.000</code> hoặc <code>-2.550.000</code> → ghi <b>chi</b> 2.550.000 VNĐ",
+        "📝 Muốn ghi khoản <b>chi</b> vào Excel, bấm nút <b>Ghi sổ chi</b> bên dưới — cần nhập thêm mật khẩu riêng.",
         reply_markup=reply_markup, parse_mode="HTML"
     )
 
@@ -361,41 +367,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "2":
         logged_in_users[user_id] = False
+        awaiting_expense_password.discard(user_id)
+        expense_mode_users.discard(user_id)
         await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
         return
 
-    # ---- Nhận diện tin nhắn là số tiền để tự ghi vào Excel (LUÔN ghi cột CHI) ----
-    amount = parse_amount_message(text)
-    if amount is not None:
-        status_msg = await update.message.reply_text(f"⏳ Đang ghi khoản chi <code>{amount:,.0f}</code> VNĐ vào Excel...", parse_mode="HTML")
-        try:
-            await asyncio.to_thread(append_transaction_and_upload, amount, False)
-            await status_msg.edit_text(
-                f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
-                f"✅ Đã ghi vào Excel thành công!",
+    # ---- Bước nhập mật khẩu RIÊNG để mở khóa ghi sổ chi ----
+    if user_id in awaiting_expense_password:
+        if text == EXPENSE_PASSWORD:
+            awaiting_expense_password.discard(user_id)
+            expense_mode_users.add(user_id)
+            await update.message.reply_text(
+                "✅ <b>Mở khóa sổ chi thành công!</b>\n"
+                "Giờ hãy gõ số tiền để ghi khoản chi, ví dụ: <code>2.550.000</code> hoặc <code>-2.550.000</code>",
                 parse_mode="HTML"
             )
-        except Exception as e:
-            error_text = str(e)
-            is_lock_error = ("423" in error_text) or ("khóa" in error_text.lower())
-            if is_lock_error:
-                # Không bắt người dùng gửi lại: tự thử lại NGẦM thêm vài lần trong vài phút,
-                # rồi cập nhật lại đúng tin nhắn này khi có kết quả cuối cùng.
-                await status_msg.edit_text(
-                    f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
-                    f"⏳ File đang bị khóa, bot sẽ tự thử lại nền trong vài phút, không cần gửi lại...",
-                    parse_mode="HTML"
-                )
-                background_retry_write(amount, False, update.effective_chat.id, status_msg.message_id)
-            else:
-                await status_msg.edit_text(
-                    f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
-                    f"❌ Lỗi ghi file:\n<code>{error_text}</code>",
-                    parse_mode="HTML"
-                )
+        else:
+            await update.message.reply_text("❌ <b>Sai mật khẩu sổ chi.</b> Vui lòng thử lại:", parse_mode="HTML")
         return
 
-    await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc gõ số tiền (vd: 2.550.000) để ghi khoản chi.")
+    # ---- Nhận diện tin nhắn là số tiền để ghi vào Excel (LUÔN ghi cột CHI) ----
+    # CHỈ áp dụng khi user đã mở khóa qua nút "Ghi sổ chi" + mật khẩu riêng.
+    if user_id in expense_mode_users:
+        amount = parse_amount_message(text)
+        if amount is not None:
+            status_msg = await update.message.reply_text(f"⏳ Đang ghi khoản chi <code>{amount:,.0f}</code> VNĐ vào Excel...", parse_mode="HTML")
+            try:
+                await asyncio.to_thread(append_transaction_and_upload, amount, False)
+                await status_msg.edit_text(
+                    f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"✅ Đã ghi vào Excel thành công!",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                error_text = str(e)
+                is_lock_error = ("423" in error_text) or ("khóa" in error_text.lower())
+                if is_lock_error:
+                    # Không bắt người dùng gửi lại: tự thử lại NGẦM thêm vài lần trong vài phút,
+                    # rồi cập nhật lại đúng tin nhắn này khi có kết quả cuối cùng.
+                    await status_msg.edit_text(
+                        f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                        f"⏳ File đang bị khóa, bot sẽ tự thử lại nền trong vài phút, không cần gửi lại...",
+                        parse_mode="HTML"
+                    )
+                    background_retry_write(amount, False, update.effective_chat.id, status_msg.message_id)
+                else:
+                    await status_msg.edit_text(
+                        f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                        f"❌ Lỗi ghi file:\n<code>{error_text}</code>",
+                        parse_mode="HTML"
+                    )
+            return
+
+    await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc bấm nút \"Ghi sổ chi\" trong menu để ghi khoản chi.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -427,6 +451,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(report, parse_mode="HTML")
         except Exception as e:
             await query.message.reply_text(f"❌ Lỗi lấy dữ liệu: {e}")
+
+    elif query.data == "add_expense":
+        if user_id in expense_mode_users:
+            await query.message.reply_text(
+                "📝 Sổ chi đã mở khóa sẵn.\nGõ số tiền để ghi khoản chi, ví dụ: <code>2.550.000</code>",
+                parse_mode="HTML"
+            )
+        else:
+            awaiting_expense_password.add(user_id)
+            await query.message.reply_text("🔐 <b>Vui lòng nhập mật khẩu riêng để mở khóa sổ chi:</b>", parse_mode="HTML")
 
 # ================== ERROR HANDLER ==================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
