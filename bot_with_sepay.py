@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== CẤU HÌNH ==================
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
-EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "0939")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
+EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "456456")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
 
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
@@ -37,21 +37,28 @@ awaiting_expense_password = set()  # user_id đang chờ nhập mật khẩu ri�
 expense_mode_users = set()  # user_id đã mở khóa, được phép gõ số tiền để ghi sổ chi
 excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
 
-# Lưu lại (chat_id, message_id) của MỌI tin nhắn (cả của user lẫn của bot) kể từ lần
-# đăng nhập gần nhất, để khi đăng xuất (gõ "2") có thể tự xóa sạch cuộc trò chuyện.
-session_messages = {}
-
-def track_message(user_id, chat_id, message_id):
-    session_messages.setdefault(user_id, []).append((chat_id, message_id))
-
-async def clear_session_messages(context, user_id):
-    ids = session_messages.pop(user_id, [])
-    for chat_id, message_id in ids:
+async def clear_chat_history(context, chat_id, from_message_id, max_delete=2000, max_consecutive_fail=40):
+    """
+    Xóa TOÀN BỘ lịch sử chat với bot mà KHÔNG cần lưu danh sách tin nhắn ở đâu cả.
+    Vì message_id trong 1 chat luôn tăng dần, chỉ cần lùi dần từ tin nhắn hiện tại
+    (from_message_id) xuống 1 và thử xóa từng ID. Dừng lại khi gặp nhiều ID liên tiếp
+    không xóa được (nghĩa là đã hết lịch sử / vượt quá 48h) để tránh gọi API vô ích.
+    """
+    msg_id = from_message_id
+    consecutive_fail = 0
+    deleted = 0
+    while msg_id > 0 and deleted < max_delete and consecutive_fail < max_consecutive_fail:
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            # Tin nhắn quá 48h, đã bị xóa trước đó, hoặc là dạng không xóa được -> bỏ qua, không chặn luồng.
-            print(f"Không xóa được tin nhắn {message_id}: {e}")
+            ok = await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            if ok:
+                deleted += 1
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+        except Exception:
+            consecutive_fail += 1
+        msg_id -= 1
+    return deleted
 
 # Regex nhận diện tin nhắn là một số tiền, ví dụ: "-2.550.000", "2.550.000", "+150000", "50k"
 AMOUNT_PATTERN = re.compile(r'^([+-]?)\s*([\d.,]+)\s*([kK]?)$')
@@ -355,35 +362,70 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 Ghi sổ chi", callback_data="add_expense")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    sent = await update.message.reply_text(
-        "🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất và xoá toàn bộ tin nhắn! .\n\n"
+    await update.message.reply_text(
+        "🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n\n"
         "📝 Muốn ghi khoản <b>chi</b> vào Excel, bấm nút <b>Ghi sổ chi</b> bên dưới — cần nhập thêm mật khẩu riêng.",
         reply_markup=reply_markup, parse_mode="HTML"
     )
-    track_message(update.effective_user.id, sent.chat_id, sent.message_id)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    track_message(user_id, update.effective_chat.id, update.message.message_id)
     if logged_in_users.get(user_id): await show_menu(update, context)
     else:
-        sent = await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
-        track_message(user_id, sent.chat_id, sent.message_id)
+        await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
+
+async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Lệnh /xoahet: xóa toàn bộ lịch sử tin nhắn gần đây trong NHÓM (của mọi người,
+    không chỉ của bot) — CHỈ dùng được trong group/supergroup, và CHỈ bởi admin
+    của nhóm đó, để tránh thành viên thường phá nhóm. Bot phải được cấp quyền
+    admin + "Xóa tin nhắn" (Delete Messages) trong nhóm thì lệnh này mới có tác dụng
+    với tin nhắn của người khác; nếu chưa có quyền, bot chỉ xóa được tin của chính nó.
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("⚠️ Lệnh này chỉ dùng trong nhóm, không dùng trong chat riêng.")
+        return
+
+    user_id = update.effective_user.id
+    try:
+        member = await context.bot.get_chat_member(chat.id, user_id)
+        is_admin = member.status in ("administrator", "creator")
+    except Exception as e:
+        is_admin = False
+        print(f"Không kiểm tra được quyền admin: {e}")
+
+    if not is_admin:
+        await update.message.reply_text("❌ Chỉ admin của nhóm mới được dùng lệnh này.")
+        return
+
+    warn = await update.message.reply_text("🧹 Đang xóa toàn bộ tin nhắn trong nhóm, vui lòng chờ...")
+    # Lùi dần từ CHÍNH tin nhắn "Đang xóa..." này (message_id cao nhất tại thời điểm gọi)
+    # để xóa luôn cả nó, tin nhắn lệnh /xoahet, và toàn bộ lịch sử phía trước.
+    deleted = await clear_chat_history(context, chat.id, warn.message_id)
+    try:
+        confirm = await context.bot.send_message(chat.id, f"✅ Đã xóa xong (khoảng {deleted} tin nhắn).")
+        async def _self_delete():
+            await asyncio.sleep(4)
+            try:
+                await context.bot.delete_message(chat_id=chat.id, message_id=confirm.message_id)
+            except Exception:
+                pass
+        asyncio.create_task(_self_delete())
+    except Exception:
+        pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip() if update.message and update.message.text else ""
-    track_message(user_id, update.effective_chat.id, update.message.message_id)
 
     if not logged_in_users.get(user_id):
         if text == BOT_PASSWORD:
             logged_in_users[user_id] = True
-            sent = await update.message.reply_text("✅ <b>Đăng nhập thành công!</b>", parse_mode="HTML")
-            track_message(user_id, sent.chat_id, sent.message_id)
+            await update.message.reply_text("✅ <b>Đăng nhập thành công!</b>", parse_mode="HTML")
             await show_menu(update, context)
         else:
-            sent = await update.message.reply_text("❌ <b>Sai mật khẩu.</b> Vui lòng thử lại:", parse_mode="HTML")
-            track_message(user_id, sent.chat_id, sent.message_id)
+            await update.message.reply_text("❌ <b>Sai mật khẩu.</b> Vui lòng thử lại:", parse_mode="HTML")
         return
 
     if text == "1":
@@ -393,14 +435,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logged_in_users[user_id] = False
         awaiting_expense_password.discard(user_id)
         expense_mode_users.discard(user_id)
-        # Xóa TOÀN BỘ tin nhắn (của bạn lẫn của bot) kể từ lúc đăng nhập, kể cả tin nhắn "2" này.
-        await clear_session_messages(context, user_id)
-        sent = await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
+        chat_id = update.effective_chat.id
+        current_msg_id = update.message.message_id
+        # Xóa TOÀN BỘ lịch sử chat này (lùi dần từ tin nhắn "2" hiện tại), không cần lưu gì cả.
+        await clear_chat_history(context, chat_id, current_msg_id)
+        sent = await context.bot.send_message(chat_id, "🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
         # Tự xóa luôn tin nhắn xác nhận này sau vài giây để cuộc trò chuyện sạch hoàn toàn.
         async def _self_delete():
             await asyncio.sleep(4)
             try:
-                await context.bot.delete_message(chat_id=sent.chat_id, message_id=sent.message_id)
+                await context.bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
             except Exception as e:
                 print(f"Không tự xóa được tin nhắn xác nhận đăng xuất: {e}")
         asyncio.create_task(_self_delete())
@@ -411,14 +455,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == EXPENSE_PASSWORD:
             awaiting_expense_password.discard(user_id)
             expense_mode_users.add(user_id)
-            sent = await update.message.reply_text(
+            await update.message.reply_text(
                 "✅ <b>Mở khóa sổ chi thành công!</b>\n"
                 "Giờ hãy gõ số tiền để ghi khoản chi, ví dụ: <code>2.550.000</code> hoặc <code>-2.550.000</code>",
                 parse_mode="HTML"
             )
         else:
-            sent = await update.message.reply_text("❌ <b>Sai mật khẩu sổ chi.</b> Vui lòng thử lại:", parse_mode="HTML")
-        track_message(user_id, sent.chat_id, sent.message_id)
+            await update.message.reply_text("❌ <b>Sai mật khẩu sổ chi.</b> Vui lòng thử lại:", parse_mode="HTML")
         return
 
     # ---- Nhận diện tin nhắn là số tiền để ghi vào Excel (LUÔN ghi cột CHI) ----
@@ -427,7 +470,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = parse_amount_message(text)
         if amount is not None:
             status_msg = await update.message.reply_text(f"⏳ Đang ghi khoản chi <code>{amount:,.0f}</code> VNĐ vào Excel...", parse_mode="HTML")
-            track_message(user_id, status_msg.chat_id, status_msg.message_id)
             try:
                 await asyncio.to_thread(append_transaction_and_upload, amount, False)
                 await status_msg.edit_text(
@@ -455,8 +497,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
 
-    sent = await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc bấm nút \"Ghi sổ chi\" trong menu để ghi khoản chi.")
-    track_message(user_id, sent.chat_id, sent.message_id)
+    await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc bấm nút \"Ghi sổ chi\" trong menu để ghi khoản chi.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -475,35 +516,29 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption_single = f"{bank['name']}\nSTK: {bank['account_number']}\nTên: {bank['account_name']}"
             media_group.append(InputMediaPhoto(media=bank['qr_url'], caption=caption_single))
             info_text += f"{i}. <b>{bank['name']}</b>\n   - STK: <code>{bank['account_number']}</code>\n   - Tên: <code>{bank['account_name']}</code>\n\n"
-        sent_photos = await query.message.reply_media_group(media=media_group)
-        for m in sent_photos:
-            track_message(user_id, m.chat_id, m.message_id)
-        sent = await query.message.reply_text(info_text, parse_mode="HTML")
-        track_message(user_id, sent.chat_id, sent.message_id)
+        await query.message.reply_media_group(media=media_group)
+        await query.message.reply_text(info_text, parse_mode="HTML")
         
     elif query.data == "check_money":
-        loading = await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
-        track_message(user_id, loading.chat_id, loading.message_id)
+        await query.message.reply_text("⏳ Đang tải dữ liệu từ OneDrive...")
         try:
             # SỬA LỖI TREO: chạy hàm blocking trong thread pool nhưng
             # VẪN Ở TRONG event loop hiện tại (không tạo asyncio.run() ở thread khác
             # -> tránh deadlock khi gọi API Telegram từ 2 event loop khác nhau)
             report = await asyncio.to_thread(get_excel_data)
-            sent = await query.message.reply_text(report, parse_mode="HTML")
+            await query.message.reply_text(report, parse_mode="HTML")
         except Exception as e:
-            sent = await query.message.reply_text(f"❌ Lỗi lấy dữ liệu: {e}")
-        track_message(user_id, sent.chat_id, sent.message_id)
+            await query.message.reply_text(f"❌ Lỗi lấy dữ liệu: {e}")
 
     elif query.data == "add_expense":
         if user_id in expense_mode_users:
-            sent = await query.message.reply_text(
+            await query.message.reply_text(
                 "📝 Sổ chi đã mở khóa sẵn.\nGõ số tiền để ghi khoản chi, ví dụ: <code>2.550.000</code>",
                 parse_mode="HTML"
             )
         else:
             awaiting_expense_password.add(user_id)
-            sent = await query.message.reply_text("🔐 <b>Vui lòng nhập mật khẩu riêng để mở khóa sổ chi:</b>", parse_mode="HTML")
-        track_message(user_id, sent.chat_id, sent.message_id)
+            await query.message.reply_text("🔐 <b>Vui lòng nhập mật khẩu riêng để mở khóa sổ chi:</b>", parse_mode="HTML")
 
 # ================== ERROR HANDLER ==================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -535,6 +570,7 @@ def main():
     # để 1 request chậm (vd tải Excel) không làm "treo" toàn bộ bot với người khác
     application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("xoahet", clearall_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
     application.add_error_handler(error_handler)
