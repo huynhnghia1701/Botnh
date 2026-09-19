@@ -114,19 +114,37 @@ def download_excel_for_write():
     except Exception as e:
         raise Exception(f"Lỗi tải file: {str(e)}")
 
-def upload_excel(content_bytes):
+def upload_excel(content_bytes, max_retries=4):
     token = get_graph_access_token()
     file_path = get_encoded_file_path()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_path}:/content"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
-    try:
-        resp = requests.put(url, headers=headers, data=content_bytes, timeout=30)
-        if resp.status_code != 200 and resp.status_code != 201:
-            print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
-            resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        raise Exception(f"Lỗi upload: {str(e)}")
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.put(url, headers=headers, data=content_bytes, timeout=30)
+            if resp.status_code == 423:
+                # File đang bị khóa (đang mở trong Excel / đang đồng bộ trên OneDrive).
+                # Đợi rồi thử lại thay vì báo lỗi ngay, vì thường tự hết khóa sau vài giây.
+                last_error = "File đang bị khóa trên OneDrive (423 Locked) — có thể đang mở trong Excel."
+                print(f"⚠️ 423 Locked, thử lại lần {attempt}/{max_retries}...")
+                time.sleep(2 * attempt)  # backoff: 2s, 4s, 6s, 8s
+                continue
+            if resp.status_code != 200 and resp.status_code != 201:
+                print(f"❌ Lỗi Graph API chi tiết: {resp.text}")
+                resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception as e:
+            last_error = str(e)
+            raise Exception(f"Lỗi upload: {last_error}")
+
+    raise Exception(
+        f"{last_error} Đã thử lại {max_retries} lần nhưng vẫn bị khóa. "
+        f"Vui lòng đóng hẳn file Excel trên mọi thiết bị (Close file, không chỉ đóng tab) rồi gửi lại số tiền."
+    )
 
 def append_transaction_and_upload(amount, is_income):
     # Khóa lại: nếu 2 giao dịch đến gần nhau cùng lúc (kể cả từ SePay lẫn từ chat),
@@ -338,6 +356,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await query.message.reply_text(f"❌ Lỗi lấy dữ liệu: {e}")
 
+# ================== ERROR HANDLER ==================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Bắt tất cả lỗi phát sinh trong quá trình xử lý update (kể cả lỗi mạng tạm thời
+    khi polling, ví dụ network_retry_loop). Chỉ log ra, không làm crash bot.
+    Trước đây không có handler này nên log Render hiện "No error handlers are registered".
+    """
+    print(f"⚠️ Exception khi xử lý update: {context.error}")
+    import traceback
+    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+
 # ================== MAIN ==================
 def main():
     if not TOKEN:
@@ -359,6 +388,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
+    application.add_error_handler(error_handler)
 
     print("Bot đang chạy...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
