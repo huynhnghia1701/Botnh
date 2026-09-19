@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== CẤU HÌNH ==================
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
-EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "456456")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
+EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "0939")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
 
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
