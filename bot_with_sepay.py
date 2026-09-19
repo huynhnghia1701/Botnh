@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== CẤU HÌNH ==================
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
-EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "456456")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
+EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "0939")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
 
 ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAY0oGKUkTxQbKia9HGESO6o?download=1"
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
@@ -374,19 +374,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
 
-async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def do_clear_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Lệnh /xoahet: xóa toàn bộ lịch sử tin nhắn gần đây trong NHÓM (của mọi người,
-    không chỉ của bot) — CHỈ dùng được trong group/supergroup, và CHỈ bởi admin
-    của nhóm đó, để tránh thành viên thường phá nhóm. Bot phải được cấp quyền
-    admin + "Xóa tin nhắn" (Delete Messages) trong nhóm thì lệnh này mới có tác dụng
-    với tin nhắn của người khác; nếu chưa có quyền, bot chỉ xóa được tin của chính nó.
+    Xóa toàn bộ lịch sử tin nhắn gần đây trong NHÓM (của mọi người, không chỉ của bot).
+    CHỈ admin của nhóm mới dùng được, để tránh thành viên thường phá nhóm. Bot phải
+    được cấp quyền admin + "Xóa tin nhắn" (Delete Messages) trong nhóm thì mới xóa
+    được tin của người khác; nếu chưa có quyền, bot chỉ xóa được tin của chính nó.
     """
     chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("⚠️ Lệnh này chỉ dùng trong nhóm, không dùng trong chat riêng.")
-        return
-
     user_id = update.effective_user.id
     try:
         member = await context.bot.get_chat_member(chat.id, user_id)
@@ -401,7 +396,7 @@ async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     warn = await update.message.reply_text("🧹 Đang xóa toàn bộ tin nhắn trong nhóm, vui lòng chờ...")
     # Lùi dần từ CHÍNH tin nhắn "Đang xóa..." này (message_id cao nhất tại thời điểm gọi)
-    # để xóa luôn cả nó, tin nhắn lệnh /xoahet, và toàn bộ lịch sử phía trước.
+    # để xóa luôn cả nó, tin nhắn lệnh, và toàn bộ lịch sử phía trước.
     deleted = await clear_chat_history(context, chat.id, warn.message_id)
     try:
         confirm = await context.bot.send_message(chat.id, f"✅ Đã xóa xong (khoảng {deleted} tin nhắn).")
@@ -415,9 +410,21 @@ async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /xoahet: chỉ dùng trong nhóm."""
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("⚠️ Lệnh này chỉ dùng trong nhóm, không dùng trong chat riêng.")
+        return
+    await do_clear_group(update, context)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip() if update.message and update.message.text else ""
+
+    # ---- Trong NHÓM: gõ "2" = xóa toàn bộ tin nhắn nhóm, KHÔNG chạy luồng menu/đăng nhập của bot qr ----
+    if update.effective_chat.type in ("group", "supergroup") and text == "2":
+        await do_clear_group(update, context)
+        return
 
     if not logged_in_users.get(user_id):
         if text == BOT_PASSWORD:
