@@ -254,19 +254,79 @@ def process_transaction(data):
                 f"✅ Đã ghi vào Excel thành công!"
             )
         else:
-            send_telegram_notification(
+            is_lock_error = ("423" in loi_chi_tiet) or ("khóa" in loi_chi_tiet.lower())
+            msg_id = send_telegram_notification(
                 f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
                 f"Nội dung: {noi_dung}\n"
-                f"❌ Lỗi ghi file:\n<code>{loi_chi_tiet}</code>"
+                + (
+                    f"⏳ File đang bị khóa, bot sẽ tự thử lại nền trong vài phút, không cần làm gì thêm..."
+                    if is_lock_error else
+                    f"❌ Lỗi ghi file:\n<code>{loi_chi_tiet}</code>"
+                )
             )
+            if is_lock_error and msg_id and TELEGRAM_CHAT_ID:
+                background_retry_write(so_tien, is_income, TELEGRAM_CHAT_ID, msg_id)
     except Exception as e:
         print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
 
 def send_telegram_notification(text):
-    if not TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TOKEN or not TELEGRAM_CHAT_ID: return None
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    except: print("Không gửi được tin nhắn Telegram.")
+        resp = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+        return resp.json().get("result", {}).get("message_id")
+    except:
+        print("Không gửi được tin nhắn Telegram.")
+        return None
+
+def edit_telegram_message(chat_id, message_id, text):
+    if not TOKEN: return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/editMessageText",
+            json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"},
+            timeout=15
+        )
+    except Exception as e:
+        print(f"Không sửa được tin nhắn Telegram: {e}")
+
+def background_retry_write(amount, is_income, chat_id, message_id, attempt=1, max_attempts=5, delay_seconds=90):
+    """
+    Dùng khi ghi Excel thất bại do file bị khóa (423) ngay cả sau các lần thử nhanh.
+    Thử lại NGẦM thêm vài lần, cách nhau delay_seconds, vì khóa phía OneDrive/Excel
+    (đồng bộ, xem trước, phiên co-authoring còn sót) có thể mất vài phút mới tự hết,
+    lâu hơn khoảng retry nhanh trong upload_excel(). Người dùng không cần gửi lại số tiền,
+    tin nhắn gốc sẽ tự được cập nhật khi có kết quả.
+    """
+    loai_text = "💰 Thu" if is_income else "💸 Chi"
+
+    def _attempt():
+        try:
+            append_transaction_and_upload(amount, is_income)
+            edit_telegram_message(
+                chat_id, message_id,
+                f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n"
+                f"✅ Đã ghi vào Excel thành công! (tự thử lại nền)"
+            )
+        except Exception as e:
+            if attempt < max_attempts:
+                edit_telegram_message(
+                    chat_id, message_id,
+                    f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"⏳ File vẫn đang bị khóa, bot đang tự thử lại nền (lần {attempt}/{max_attempts})..."
+                )
+                threading.Timer(
+                    delay_seconds, background_retry_write,
+                    args=(amount, is_income, chat_id, message_id, attempt + 1, max_attempts, delay_seconds)
+                ).start()
+            else:
+                edit_telegram_message(
+                    chat_id, message_id,
+                    f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"❌ Vẫn lỗi sau nhiều lần thử nền:\n<code>{str(e)}</code>\n"
+                    f"Vui lòng kiểm tra file Excel trên OneDrive rồi gửi lại số tiền."
+                )
+
+    threading.Thread(target=_attempt, daemon=True).start()
 
 # ================== HÀM TELEGRAM BOT ==================
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,11 +376,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         except Exception as e:
-            await status_msg.edit_text(
-                f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
-                f"❌ Lỗi ghi file:\n<code>{str(e)}</code>",
-                parse_mode="HTML"
-            )
+            error_text = str(e)
+            is_lock_error = ("423" in error_text) or ("khóa" in error_text.lower())
+            if is_lock_error:
+                # Không bắt người dùng gửi lại: tự thử lại NGẦM thêm vài lần trong vài phút,
+                # rồi cập nhật lại đúng tin nhắn này khi có kết quả cuối cùng.
+                await status_msg.edit_text(
+                    f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"⏳ File đang bị khóa, bot sẽ tự thử lại nền trong vài phút, không cần gửi lại...",
+                    parse_mode="HTML"
+                )
+                background_retry_write(amount, False, update.effective_chat.id, status_msg.message_id)
+            else:
+                await status_msg.edit_text(
+                    f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"❌ Lỗi ghi file:\n<code>{error_text}</code>",
+                    parse_mode="HTML"
+                )
         return
 
     await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc gõ số tiền (vd: 2.550.000) để ghi khoản chi.")
