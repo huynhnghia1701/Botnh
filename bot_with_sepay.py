@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import gc
+import re
 import asyncio
 import threading
 import time
@@ -32,6 +33,9 @@ GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"]
 app_web = Flask(__name__)
 logged_in_users = {}
 excel_write_lock = threading.Lock()  # đảm bảo chỉ ghi 1 giao dịch vào Excel tại 1 thời điểm
+
+# Regex nhận diện tin nhắn là một số tiền, ví dụ: "-2.550.000", "2.550.000", "+150000", "50k"
+AMOUNT_PATTERN = re.compile(r'^([+-]?)\s*([\d.,]+)\s*([kK]?)$')
 
 BANKS = [
     {"name": "Vietcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "96886693059121", "qr_url": "https://api.vietqr.io/image/MSB-96886693059121-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
@@ -125,8 +129,8 @@ def upload_excel(content_bytes):
         raise Exception(f"Lỗi upload: {str(e)}")
 
 def append_transaction_and_upload(amount, is_income):
-    # Khóa lại: nếu 2 giao dịch SePay đến gần nhau cùng lúc, giao dịch thứ 2
-    # phải CHỜ giao dịch thứ 1 ghi + upload xong hẳn mới được bắt đầu.
+    # Khóa lại: nếu 2 giao dịch đến gần nhau cùng lúc (kể cả từ SePay lẫn từ chat),
+    # giao dịch thứ 2 phải CHỜ giao dịch thứ 1 ghi + upload xong hẳn mới được bắt đầu.
     # Tránh trường hợp cả 2 cùng tải bản cũ -> cùng ghi -> cái ghi sau đè mất cái ghi trước.
     with excel_write_lock:
         try:
@@ -159,6 +163,38 @@ def append_transaction_and_upload(amount, is_income):
             # Ném lại lỗi NGUYÊN VĂN (không bọc thêm "Lỗi ghi file:") để
             # tin nhắn Telegram hiển thị đúng chi tiết lỗi gốc, dễ debug hơn.
             raise
+
+# ================== HÀM PHÂN TÍCH SỐ TIỀN TỪ TIN NHẮN CHAT ==================
+def parse_amount_message(text):
+    """
+    Nhận diện tin nhắn dạng số tiền để ghi vào cột CHI (cột B) mà thôi.
+    Dấu +/- (nếu có) chỉ là ký hiệu, không quyết định thu/chi — mọi số tiền
+    gõ vào chat đều được ghi là khoản CHI. Ví dụ:
+      "-2.550.000" -> chi 2.550.000
+      "2.550.000"  -> chi 2.550.000
+      "50k"        -> chi 50.000
+    Trả về amount:int hoặc None nếu không khớp.
+    """
+    if not text:
+        return None
+    match = AMOUNT_PATTERN.match(text.strip())
+    if not match:
+        return None
+    _sign, number_part, k_suffix = match.groups()
+
+    # Bỏ dấu chấm/phẩy phân cách hàng nghìn
+    cleaned = number_part.replace('.', '').replace(',', '')
+    if not cleaned.isdigit():
+        return None
+
+    amount = int(cleaned)
+    if k_suffix:  # hỗ trợ viết tắt kiểu "50k" = 50.000
+        amount *= 1000
+
+    if amount <= 0:
+        return None
+
+    return amount
 
 # ================== WEBHOOK SEPAY ==================
 @app_web.route('/ping', methods=['GET'])
@@ -218,7 +254,12 @@ def send_telegram_notification(text):
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")], [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.", reply_markup=reply_markup, parse_mode="HTML")
+    await update.message.reply_text(
+        "🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n\n"
+        "💡 Bạn cũng có thể gõ thẳng số tiền để ghi khoản <b>chi</b>, ví dụ:\n"
+        "  • <code>2.550.000</code> hoặc <code>-2.550.000</code> → ghi <b>chi</b> 2.550.000 VNĐ",
+        reply_markup=reply_markup, parse_mode="HTML"
+    )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -236,11 +277,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ <b>Sai mật khẩu.</b> Vui lòng thử lại:", parse_mode="HTML")
         return
-    if text == "1": await show_menu(update, context)
-    elif text == "2":
+
+    if text == "1":
+        await show_menu(update, context)
+        return
+    if text == "2":
         logged_in_users[user_id] = False
         await update.message.reply_text("🔒 <b>Bạn đã đăng xuất thành công. Menu đã được khóa lại!</b>", parse_mode="HTML")
-    else: await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1")
+        return
+
+    # ---- Nhận diện tin nhắn là số tiền để tự ghi vào Excel (LUÔN ghi cột CHI) ----
+    amount = parse_amount_message(text)
+    if amount is not None:
+        status_msg = await update.message.reply_text(f"⏳ Đang ghi khoản chi <code>{amount:,.0f}</code> VNĐ vào Excel...", parse_mode="HTML")
+        try:
+            await asyncio.to_thread(append_transaction_and_upload, amount, False)
+            await status_msg.edit_text(
+                f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                f"✅ Đã ghi vào Excel thành công!",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await status_msg.edit_text(
+                f"💸 Chi: <code>{amount:,.0f}</code> VNĐ\n"
+                f"❌ Lỗi ghi file:\n<code>{str(e)}</code>",
+                parse_mode="HTML"
+            )
+        return
+
+    await update.message.reply_text("💡 Nếu Muốn Tìm Menu Ấn Số 1\nHoặc gõ số tiền (vd: 2.550.000) để ghi khoản chi.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
