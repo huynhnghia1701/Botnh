@@ -7,6 +7,7 @@ import asyncio
 import threading
 import time
 import multiprocessing
+import html
 from datetime import datetime
 from urllib.parse import quote
 import pytz
