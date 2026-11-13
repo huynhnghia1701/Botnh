@@ -21,7 +21,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 BOT_PASSWORD = "123123"
 EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "0939")  # Mật khẩu RIÊNG để mở khóa ghi sổ chi — đổi qua biến môi trường EXPENSE_PASSWORD nếu muốn
 
-ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQDYUEgvvFlYRqhwhjmw-EFIAbz0YxwGs7xuzBlCjPq4Ou8?download=1"
+ONEDRIVE_URL = "https://1drv.ms/x/c/813BCA548F1AB473/IQAOxT3zilnwR5P-loHDlMpJARNGOx5rWcXkOx9kyBftIms?download=1
+"
 GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")          
 ONEDRIVE_TOKEN_CACHE = os.getenv("ONEDRIVE_TOKEN_CACHE", "")  
 ONEDRIVE_FILE_PATH = os.getenv("ONEDRIVE_FILE_PATH", "")      
