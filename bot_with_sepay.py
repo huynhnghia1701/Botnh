@@ -496,7 +496,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_button))
     application.add_error_handler(error_handler)
     print("Bot đang chạy...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == "__main__":
     main()
