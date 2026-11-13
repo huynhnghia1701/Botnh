@@ -496,23 +496,45 @@ def run_telegram_bot():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # ================== MAIN ==================
+# ================== MAIN ==================
 def main():
+    if not TOKEN:
+        print("LỖI: Chưa cài BOT_TOKEN!")
+        sys.exit(1)
+
+    try:
+        _validate_graph_config()
+        print("✅ Env Graph API đầy đủ.")
+    except Exception as e:
+        print(f"❌ {e}")
+
+    # 1. Chạy Flask trong một luồng (thread) nền, daemon=True để tự tắt khi main thread dừng
     port = int(os.environ.get("PORT", 10000))
     from waitress import serve
-    flask_thread = threading.Thread(target=lambda: serve(app_web, host="0.0.0.0", port=port), daemon=True)
+    flask_thread = threading.Thread(
+        target=lambda: serve(app_web, host="0.0.0.0", port=port),
+        daemon=True
+    )
     flask_thread.start()
     print(f"Web server chạy cổng {port}")
-    
-    bot_process = multiprocessing.Process(target=run_telegram_bot)
-    bot_process.start()
-    print("Đã khởi chạy tiến trình bot Telegram riêng biệt.")
-    
+
+    # 2. Xóa webhook cũ
     try:
-        bot_process.join()
-    except KeyboardInterrupt:
-        print("Đang dừng...")
-        bot_process.terminate()
-        bot_process.join()
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+        print("Đã xóa webhook cũ!")
+    except Exception:
+        pass
+
+    # 3. Khởi tạo và chạy Bot Telegram ở luồng chính
+    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("xoahet", clearall_command))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(CallbackQueryHandler(handle_button))
+    application.add_error_handler(error_handler)
+
+    print("Bot đang chạy...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
