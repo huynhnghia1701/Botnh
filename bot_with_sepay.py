@@ -508,7 +508,7 @@ def main():
     except Exception as e:
         print(f"❌ {e}")
 
-    # 1. Chạy Flask trong một luồng (thread) nền, daemon=True để tự tắt khi main thread dừng
+    # 1. Chạy Flask trong một luồng (thread) nền
     port = int(os.environ.get("PORT", 10000))
     from waitress import serve
     flask_thread = threading.Thread(
@@ -525,7 +525,14 @@ def main():
     except Exception:
         pass
 
-    # 3. Khởi tạo và chạy Bot Telegram ở luồng chính
+    # 3. Tạo một event loop mới cho tiến trình chính (Fix cho Python 3.14)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    # 4. Khởi tạo và chạy Bot Telegram
     application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("xoahet", clearall_command))
