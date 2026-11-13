@@ -3,7 +3,6 @@ import sys
 import io
 import gc
 import re
-import json
 import asyncio
 import threading
 import time
@@ -23,11 +22,11 @@ BOT_PASSWORD = os.getenv("BOT_PASSWORD", "123123")
 EXPENSE_PASSWORD = os.getenv("EXPENSE_PASSWORD", "0939")
 
 # --- Microsoft Graph / OneDrive ---
-GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")            # BẮT BUỘC
+GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID", "")
 GRAPH_AUTHORITY = os.getenv("GRAPH_AUTHORITY", "https://login.microsoftonline.com/consumers")
 GRAPH_SCOPES = ["Files.ReadWrite", "User.Read", "offline_access"]
-GRAPH_REFRESH_TOKEN = os.getenv("GRAPH_REFRESH_TOKEN", "")    # token cache (serialized) HOẶC refresh_token thô
-ONEDRIVE_FILE_PATH = os.getenv("ONEDRIVE_FILE_PATH", "")     # ví dụ: "Documents/SoThuChi.xlsx"
+GRAPH_REFRESH_TOKEN = os.getenv("GRAPH_REFRESH_TOKEN", "")
+ONEDRIVE_FILE_PATH = os.getenv("ONEDRIVE_FILE_PATH", "")
 
 # --- SePay / Telegram ---
 SEPAY_API_KEY = os.getenv("SEPAY_API_KEY", "")
@@ -35,13 +34,43 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- Excel ---
 EXCEL_DATA_START_ROW = int(os.getenv("EXCEL_DATA_START_ROW", "2"))
-EXCEL_DATA_END_ROW = int(os.getenv("EXCEL_DATA_END_ROW", "27"))  # inclusive
+EXCEL_DATA_END_ROW = int(os.getenv("EXCEL_DATA_END_ROW", "27"))
+
+# --- API test ---
+API_TEST_TOKEN = os.getenv("API_TEST_TOKEN", "")
 
 app_web = Flask(__name__)
 logged_in_users = {}
 awaiting_expense_password = set()
 expense_mode_users = set()
 excel_write_lock = threading.Lock()
+
+AMOUNT_PATTERN = re.compile(r'^([+-]?)\s*([\d.,]+)\s*([kK]?)$')
+
+BANKS = [
+    {"name": "Vietcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "96886693059121", "qr_url": "https://api.vietqr.io/image/MSB-96886693059121-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
+    {"name": "OCB (Phương Đông)", "account_name": "HUYNH NGOC NGHIA", "account_number": "OCB-SEPHN48935", "qr_url": "https://api.vietqr.io/image/OCB-SEPHN48935-compact2.png?accountName=HUYNH%20NGOC%20NGHIA"},
+    {"name": "LPBank", "account_name": "HUYNH NGOC NGHIA", "account_number": "0916856322", "qr_url": "https://api.vietqr.io/image/970449-0916856322-compact2.jpg?accountName=HUYNH%20NGOC%20NGHIA"},
+    {"name": "Techcombank", "account_name": "HUYNH NGOC NGHIA", "account_number": "3838396852", "qr_url": "https://api.vietqr.io/image/970407-3838396852-compact2.jpg?accountName=HUYNH%20NGOC%20NGHIA"}
+]
+
+# ================== CLEAR CHAT ==================
+async def clear_chat_history(context, chat_id, from_message_id, max_delete=2000, max_consecutive_fail=40):
+    msg_id = from_message_id
+    consecutive_fail = 0
+    deleted = 0
+    while msg_id > 0 and deleted < max_delete and consecutive_fail < max_consecutive_fail:
+        try:
+            ok = await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            if ok:
+                deleted += 1
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+        except Exception:
+            consecutive_fail += 1
+        msg_id -= 1
+    return deleted
 
 # ================== MICROSOFT GRAPH AUTH ==================
 def _validate_graph_config():
@@ -52,22 +81,14 @@ def _validate_graph_config():
     if not ONEDRIVE_FILE_PATH:
         raise Exception("ONEDRIVE_FILE_PATH đang trống! Cần set env trên Render.")
 
-
 def get_graph_access_token():
-    """
-    Lấy access token theo thứ tự ưu tiên:
-      1) Thử acquire_token_silent từ SerializableTokenCache (nếu env là token cache serialized)
-      2) Nếu thất bại, dùng refresh_token thô để lấy access token mới
-    """
     _validate_graph_config()
 
-    # --- Cách 1: env là token cache serialized (khuyến nghị) ---
+    # Cách 1: token cache serialized
     try:
         cache = msal.SerializableTokenCache()
         cache.deserialize(GRAPH_REFRESH_TOKEN)
-        app = msal.PublicClientApplication(
-            GRAPH_CLIENT_ID, authority=GRAPH_AUTHORITY, token_cache=cache
-        )
+        app = msal.PublicClientApplication(GRAPH_CLIENT_ID, authority=GRAPH_AUTHORITY, token_cache=cache)
         accounts = app.get_accounts()
         if accounts:
             result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
@@ -76,31 +97,24 @@ def get_graph_access_token():
     except Exception as e:
         print(f"⚠️ acquire_token_silent thất bại: {e}")
 
-    # --- Cách 2: env là refresh_token thô ---
+    # Cách 2: refresh_token thô
     try:
         app = msal.PublicClientApplication(GRAPH_CLIENT_ID, authority=GRAPH_AUTHORITY)
-        result = app.acquire_token_by_refresh_token(
-            GRAPH_REFRESH_TOKEN, scopes=GRAPH_SCOPES
-        )
+        result = app.acquire_token_by_refresh_token(GRAPH_REFRESH_TOKEN, scopes=GRAPH_SCOPES)
         if result and "access_token" in result:
             new_refresh = result.get("refresh_token")
             if new_refresh:
-                print(
-                    "🔑 Refresh token mới (copy vào env GRAPH_REFRESH_TOKEN nếu muốn):",
-                    new_refresh[:20] + "..."
-                )
+                print("🔑 Refresh token mới (copy vào env GRAPH_REFRESH_TOKEN nếu muốn):", new_refresh[:20] + "...")
             return result["access_token"]
     except Exception as e:
         raise Exception(f"Không lấy được access token: {e}")
 
     raise Exception(
         "Không lấy được access token. Kiểm tra GRAPH_CLIENT_ID / GRAPH_REFRESH_TOKEN. "
-        "(refresh_token có thể đã hết hạn hoặc bị thu hồi — cần login lại bằng script local.)"
+        "(refresh_token có thể đã hết hạn — cần login lại bằng script local.)"
     )
 
-
 def _encoded_file_path():
-    """Encode path OneDrive để đưa vào URL Graph API."""
     path = ONEDRIVE_FILE_PATH.strip().strip("/")
     if not path:
         raise Exception("ONEDRIVE_FILE_PATH đang trống!")
@@ -109,28 +123,16 @@ def _encoded_file_path():
         return f"{quote(folder)}/{quote(filename)}"
     return quote(path)
 
-
-# ================== ĐỌC EXCEL (API) ==================
+# ================== ĐỌC / GHI EXCEL ==================
 def download_excel_for_write():
-    """Tải file Excel từ OneDrive qua Graph API -> trả về bytes."""
     token = get_graph_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{_encoded_file_path()}:/content"
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    )
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     if resp.status_code != 200:
-        raise Exception(
-            f"Graph API tải file lỗi {resp.status_code}: {resp.text[:300]}"
-        )
+        raise Exception(f"Graph API tải file lỗi {resp.status_code}: {resp.text[:300]}")
     return resp.content
 
-
 def get_excel_data():
-    """
-    Đọc dữ liệu Excel từ OneDrive qua Graph API, trả về text báo cáo cho Telegram.
-    """
     try:
         with excel_write_lock:
             content = download_excel_for_write()
@@ -169,10 +171,7 @@ def get_excel_data():
     except Exception as e:
         return f"❌ Lỗi đọc Excel: {e}"
 
-
-# ================== GHI EXCEL (API) ==================
 def upload_excel(content_bytes, max_retries=4):
-    """Upload file bytes lên OneDrive qua Graph API, retry khi bị 423 Locked."""
     token = get_graph_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{_encoded_file_path()}:/content"
     headers = {
@@ -194,12 +193,10 @@ def upload_excel(content_bytes, max_retries=4):
         resp.raise_for_status()
 
     raise Exception(
-        f"{last_error} Đã thử {max_retries} lần. "
-        f"Đóng hẳn file Excel trên mọi thiết bị rồi gửi lại."
+        f"{last_error} Đã thử {max_retries} lần. Đóng hẳn file Excel trên mọi thiết bị rồi gửi lại."
     )
 
 def append_transaction_and_upload(amount, is_income):
-    """Ghi 1 giao dịch vào cột thu/chi ở dòng trống đầu tiên, rồi upload."""
     with excel_write_lock:
         content = download_excel_for_write()
         workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
@@ -212,9 +209,7 @@ def append_transaction_and_upload(amount, is_income):
                 target_row = i
                 break
         if target_row is None:
-            raise Exception(
-                f"Hết chỗ trống trong bảng (dòng {EXCEL_DATA_START_ROW}-{EXCEL_DATA_END_ROW})."
-            )
+            raise Exception(f"Hết chỗ trống trong bảng (dòng {EXCEL_DATA_START_ROW}-{EXCEL_DATA_END_ROW}).")
 
         sheet.cell(row=target_row, column=col).value = amount
 
@@ -225,23 +220,51 @@ def append_transaction_and_upload(amount, is_income):
 
         del workbook, sheet, content, buf
         gc.collect()
-        # ================== API TEST (dùng để debug trên Render) ==================
-API_TEST_TOKEN = os.getenv("API_TEST_TOKEN", "")  # đặt env để bảo vệ endpoint
 
+# ================== PARSE AMOUNT ==================
+def parse_amount_message(text):
+    if not text:
+        return None
+    match = AMOUNT_PATTERN.match(text.strip())
+    if not match:
+        return None
+    _sign, number_part, k_suffix = match.groups()
+
+    if not re.fullmatch(r'\d{1,3}(\.\d{3})*|\d+', number_part):
+        return None
+    cleaned = number_part.replace('.', '')
+    if not cleaned.isdigit():
+        return None
+
+    amount = int(cleaned)
+    if k_suffix:
+        amount *= 1000
+    if amount <= 0:
+        return None
+    return amount
+
+# ================== API TEST ==================
 def _check_api_auth():
     if not API_TEST_TOKEN:
-        return True  # nếu chưa đặt thì bỏ qua (chỉ dùng khi test local)
+        return True
     return request.headers.get("X-Api-Token") == API_TEST_TOKEN
-
 
 @app_web.route("/ping", methods=["GET"])
 def ping():
     return "OK", 200
 
+@app_web.route("/api/graph/token", methods=["GET"])
+def api_graph_token():
+    if not _check_api_auth():
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    try:
+        token = get_graph_access_token()
+        return jsonify({"success": True, "token_prefix": token[:20] + "..."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app_web.route("/api/excel/read", methods=["GET"])
 def api_excel_read():
-    """GET: đọc toàn bộ dữ liệu thu/chi trong Excel."""
     if not _check_api_auth():
         return jsonify({"success": False, "message": "Unauthorized"}), 401
     try:
@@ -271,13 +294,8 @@ def api_excel_read():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app_web.route("/api/excel/append", methods=["POST"])
 def api_excel_append():
-    """
-    POST body JSON:
-      { "amount": 2550000, "type": "expense" }   # hoặc "income"
-    """
     if not _check_api_auth():
         return jsonify({"success": False, "message": "Unauthorized"}), 401
     data = request.get_json(force=True, silent=True) or {}
@@ -295,48 +313,131 @@ def api_excel_append():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
-@app_web.route("/api/graph/token", methods=["GET"])
-def api_graph_token():
-    """GET: kiểm tra Graph API có lấy được token không (không trả token thật)."""
-    if not _check_api_auth():
+# ================== SEPAY WEBHOOK ==================
+@app_web.route("/sepay-webhook", methods=["POST"])
+def sepay_webhook():
+    auth_header = request.headers.get("Authorization", "")
+    if not SEPAY_API_KEY or SEPAY_API_KEY not in auth_header:
         return jsonify({"success": False, "message": "Unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    threading.Thread(target=process_transaction, args=(data,), daemon=True).start()
+    return jsonify({"success": True}), 200
+
+def process_transaction(data):
     try:
-        token = get_graph_access_token()
-        return jsonify({"success": True, "token_prefix": token[:20] + "..."})
+        noi_dung = data.get("content", "")
+        so_tien = data.get("transferAmount", 0)
+        loai_gd = data.get("transferType")
+        is_income = (loai_gd == "in")
+
+        loi_chi_tiet = ""
+        try:
+            append_transaction_and_upload(so_tien, is_income)
+            ghi_thanh_cong = True
+        except Exception as e:
+            ghi_thanh_cong = False
+            loi_chi_tiet = str(e)
+            print(f"❌ Lỗi ghi Excel: {loi_chi_tiet}")
+
+        loai_text = "💰 Nhận tiền (in)" if is_income else "💸 Chi tiền (out)"
+
+        if ghi_thanh_cong:
+            send_telegram_notification(
+                f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
+                f"Nội dung: {noi_dung}\n"
+                f"----------------------------------------\n"
+                f"✅ Đã ghi vào Excel thành công!"
+            )
+        else:
+            is_lock_error = ("423" in loi_chi_tiet) or ("khóa" in loi_chi_tiet.lower())
+            msg_id = send_telegram_notification(
+                f"{loai_text}: <code>{so_tien:,.0f}</code> VNĐ\n"
+                f"Nội dung: {noi_dung}\n"
+                + (
+                    f"⏳ File đang bị khóa, bot sẽ tự thử lại nền trong vài phút..."
+                    if is_lock_error else
+                    f"❌ Lỗi ghi file:\n<code>{loi_chi_tiet}</code>"
+                )
+            )
+            if is_lock_error and msg_id and TELEGRAM_CHAT_ID:
+                background_retry_write(so_tien, is_income, TELEGRAM_CHAT_ID, msg_id)
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-        def main():
-    if not TOKEN:
-        print("LỖI: Chưa cài BOT_TOKEN!")
-        sys.exit(1)
+        print(f"❌ LỖI XỬ LÝ GIAO DỊCH SEPAY: {str(e)}")
 
+def send_telegram_notification(text):
+    if not TOKEN or not TELEGRAM_CHAT_ID:
+        return None
     try:
-        _validate_graph_config()
-        print("✅ Env Graph API đầy đủ.")
-    except Exception as e:
-        print(f"❌ {e}")
-
-    port = int(os.environ.get("PORT", 10000))
-    from waitress import serve
-    threading.Thread(
-        target=lambda: serve(app_web, host="0.0.0.0", port=port),
-        daemon=True,
-    ).start()
-
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        return resp.json().get("result", {}).get("message_id")
     except Exception:
-        pass
+        print("Không gửi được tin nhắn Telegram.")
+        return None
 
-    application = (
-        Application.builder().token(TOKEN).concurrent_updates(True).build()
+def edit_telegram_message(chat_id, message_id, text):
+    if not TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/editMessageText",
+            json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"Không sửa được tin nhắn Telegram: {e}")
+
+def background_retry_write(amount, is_income, chat_id, message_id, attempt=1, max_attempts=5, delay_seconds=90):
+    loai_text = "💰 Thu" if is_income else "💸 Chi"
+
+    def _attempt():
+        try:
+            append_transaction_and_upload(amount, is_income)
+            edit_telegram_message(
+                chat_id, message_id,
+                f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n✅ Đã ghi vào Excel thành công! (tự thử lại nền)"
+            )
+        except Exception as e:
+            if attempt < max_attempts:
+                edit_telegram_message(
+                    chat_id, message_id,
+                    f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"⏳ File vẫn đang bị khóa, bot đang tự thử lại nền (lần {attempt}/{max_attempts})..."
+                )
+                threading.Timer(
+                    delay_seconds, background_retry_write,
+                    args=(amount, is_income, chat_id, message_id, attempt + 1, max_attempts, delay_seconds)
+                ).start()
+            else:
+                edit_telegram_message(
+                    chat_id, message_id,
+                    f"{loai_text}: <code>{amount:,.0f}</code> VNĐ\n"
+                    f"❌ Vẫn lỗi sau nhiều lần thử nền:\n<code>{str(e)}</code>\n"
+                    f"Vui lòng kiểm tra file Excel trên OneDrive rồi gửi lại số tiền."
+                )
+
+    threading.Thread(target=_attempt, daemon=True).start()
+
+# ================== TELEGRAM BOT ==================
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📱 Lấy mã QR", callback_data="get_qr")],
+        [InlineKeyboardButton("💰 Kiểm tra tiền", callback_data="check_money")],
+        [InlineKeyboardButton("📝 Ghi sổ chi", callback_data="add_expense")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🤖 Xin chào!\nNhập số <b>1</b> hoặc bấm menu dưới đây để chọn chức năng.\nNhập số <b>2</b> để đăng xuất.\n\n"
+        "📝 Muốn ghi khoản <b>chi</b> vào Excel, bấm nút <b>Ghi sổ chi</b> — cần nhập thêm mật khẩu riêng.",
+        reply_markup=reply_markup, parse_mode="HTML"
     )
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("xoahet", clearall_command))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(CallbackQueryHandler(handle_button))
-    application.add_error_handler(error_handler)
 
-    print("Bot đang chạy...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if logged_in_users.get(user_id):
+        await show_menu(update, context)
+    else:
+        await update.message.reply_text("🔐 <
