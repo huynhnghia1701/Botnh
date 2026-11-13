@@ -440,4 +440,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if logged_in_users.get(user_id):
         await show_menu(update, context)
     else:
-        await update.message.reply_text("🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:", parse_mode="HTML")
+        await update.message.reply_text(
+            "🔐 <b>Menu được bảo vệ.</b>\nVui lòng nhập mật khẩu để tiếp tục:",
+            parse_mode="HTML"
+        )
