@@ -6,6 +6,7 @@ import re
 import asyncio
 import threading
 import time
+import multiprocessing
 from datetime import datetime
 from urllib.parse import quote
 import pytz
@@ -470,66 +471,43 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     import traceback
     traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
 
-# ================== MAIN ==================
-import multiprocessing
-
-# ... (các import và code phía trên giữ nguyên)
-
 # ================== HÀM CHẠY BOT TELEGRAM ==================
 def run_telegram_bot():
-    """
-    Hàm này chạy trong một tiến trình riêng biệt.
-    Nó khởi tạo và chạy bot Telegram với event loop của riêng nó.
-    """
     if not TOKEN:
         print("LỖI: Chưa cài BOT_TOKEN!")
         return
-
     try:
         _validate_graph_config()
         print("✅ Env Graph API đầy đủ.")
     except Exception as e:
         print(f"❌ {e}")
-
-    # Xóa webhook cũ
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
         print("Đã xóa webhook cũ!")
     except Exception:
         pass
-
-    # Khởi tạo Application
     application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("xoahet", clearall_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(handle_button))
     application.add_error_handler(error_handler)
-
     print("Bot đang chạy...")
-    # Chạy polling trong tiến trình riêng, không cần close_loop=False
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # ================== MAIN ==================
 def main():
-    # Khởi chạy Flask trong tiến trình chính (hoặc thread nền)
     port = int(os.environ.get("PORT", 10000))
     from waitress import serve
-    flask_thread = threading.Thread(
-        target=lambda: serve(app_web, host="0.0.0.0", port=port),
-        daemon=True
-    )
+    flask_thread = threading.Thread(target=lambda: serve(app_web, host="0.0.0.0", port=port), daemon=True)
     flask_thread.start()
     print(f"Web server chạy cổng {port}")
-
-    # Khởi chạy bot Telegram trong một tiến trình riêng biệt
+    
     bot_process = multiprocessing.Process(target=run_telegram_bot)
     bot_process.start()
     print("Đã khởi chạy tiến trình bot Telegram riêng biệt.")
-
-    # Giữ cho tiến trình chính (Flask) luôn chạy
+    
     try:
-        # Chờ cho đến khi bot_process kết thúc (nếu có lỗi)
         bot_process.join()
     except KeyboardInterrupt:
         print("Đang dừng...")
