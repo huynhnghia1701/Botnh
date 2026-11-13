@@ -120,12 +120,6 @@ def download_excel_for_write():
 def get_excel_data():
     try:
         with excel_write_lock:
-            content = download_excel_for_write() # <-- Nó gọi hàm ở trên
-        workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-        # ... (phần còn lại của hàm get_excel_data giữ nguyên) ...
-def get_excel_data():
-    try:
-        with excel_write_lock:
             content = download_excel_for_write()
         workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         sheet = workbook.active
@@ -143,26 +137,25 @@ def get_excel_data():
         chi_total = sum(v for v in chi_list if isinstance(v, (int, float)))
         remain = thu_total - chi_total
         
-        # ĐÂY LÀ PHẦN FORMAT BẠN MUỐN GIỮ NGUYÊN
         msg = "📊 <b>BÁO CÁO SỔ THU CHI (ONEDRIVE)</b>\n" + "-" * 40 + "\n"
         msg += "📥 <b>DANH SÁCH THU:</b>\n"
         for val in thu_list:
             msg += f"  • {val:,.0f} VNĐ\n" if isinstance(val, (int, float)) else f"  • {val}\n"
+            
         msg += "\n📤 <b>DANH SÁCH CHI:</b>\n"
         for val in chi_list:
             msg += f"  • {val:,.0f} VNĐ\n" if isinstance(val, (int, float)) else f"  • {val}\n"
+            
         msg += "-" * 40 + "\n"
         msg += f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total:,.0f}</code> VNĐ\n"
         msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
-        
-        # DÒNG QUAN TRỌNG BỊ THIẾU Ở LẦN TRƯỚC - ĐÃ BỔ SUNG ĐẦY ĐỦ
         msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
         
         del workbook, sheet
         gc.collect()
         return msg
     except Exception as e:
-        # NẾU CÓ LỖI, PHẢI ESCAPE ĐỂ KHÔNG BỊ LỖI HTML
+        # Mã hóa lỗi để không bị văng lỗi HTML
         safe_error = html.escape(str(e))
         return f"❌ Lỗi đọc Excel: {safe_error}"
 # ================== GHI EXCEL ==================
