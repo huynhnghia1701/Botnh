@@ -306,3 +306,37 @@ def api_graph_token():
         return jsonify({"success": True, "token_prefix": token[:20] + "..."})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+        def main():
+    if not TOKEN:
+        print("LỖI: Chưa cài BOT_TOKEN!")
+        sys.exit(1)
+
+    try:
+        _validate_graph_config()
+        print("✅ Env Graph API đầy đủ.")
+    except Exception as e:
+        print(f"❌ {e}")
+
+    port = int(os.environ.get("PORT", 10000))
+    from waitress import serve
+    threading.Thread(
+        target=lambda: serve(app_web, host="0.0.0.0", port=port),
+        daemon=True,
+    ).start()
+
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+    except Exception:
+        pass
+
+    application = (
+        Application.builder().token(TOKEN).concurrent_updates(True).build()
+    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("xoahet", clearall_command))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(CallbackQueryHandler(handle_button))
+    application.add_error_handler(error_handler)
+
+    print("Bot đang chạy...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
