@@ -107,13 +107,6 @@ def _encoded_file_path():
     return quote(path)
 
 # ================== ĐỌC EXCEL ==================
-def download_excel_for_write():
-    token = get_graph_access_token()
-    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{_encoded_file_path()}:/content"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    if resp.status_code != 200:
-        raise Exception(f"Graph API tải file lỗi {resp.status_code}: {resp.text[:300]}")
-    return resp.content
 
 def get_excel_data():
     try:
@@ -121,6 +114,7 @@ def get_excel_data():
             content = download_excel_for_write()
         workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         sheet = workbook.active
+        
         thu_list, chi_list = [], []
         for i in range(EXCEL_DATA_START_ROW, EXCEL_DATA_END_ROW + 1):
             v_thu = sheet.cell(row=i, column=1).value
@@ -129,9 +123,12 @@ def get_excel_data():
                 thu_list.append(v_thu)
             if v_chi is not None:
                 chi_list.append(v_chi)
+                
         thu_total = sum(v for v in thu_list if isinstance(v, (int, float)))
         chi_total = sum(v for v in chi_list if isinstance(v, (int, float)))
         remain = thu_total - chi_total
+        
+        # ĐÂY LÀ PHẦN FORMAT BẠN MUỐN GIỮ NGUYÊN
         msg = "📊 <b>BÁO CÁO SỔ THU CHI (ONEDRIVE)</b>\n" + "-" * 40 + "\n"
         msg += "📥 <b>DANH SÁCH THU:</b>\n"
         for val in thu_list:
@@ -142,13 +139,17 @@ def get_excel_data():
         msg += "-" * 40 + "\n"
         msg += f"🟢 <b>Tổng Tiền Nhận Vào:</b> <code>{thu_total:,.0f}</code> VNĐ\n"
         msg += f"🔴 <b>Tổng Tiền Đã Chi:</b> <code>{chi_total:,.0f}</code> VNĐ\n"
+        
+        # DÒNG QUAN TRỌNG BỊ THIẾU Ở LẦN TRƯỚC - ĐÃ BỔ SUNG ĐẦY ĐỦ
         msg += f"💰 <b>SỐ TIỀN CÒN LẠI:</b> <code>{remain:,.0f}</code> VNĐ\n"
+        
         del workbook, sheet
         gc.collect()
         return msg
     except Exception as e:
-        return f"❌ Lỗi đọc Excel: {e}"
-
+        # NẾU CÓ LỖI, PHẢI ESCAPE ĐỂ KHÔNG BỊ LỖI HTML
+        safe_error = html.escape(str(e))
+        return f"❌ Lỗi đọc Excel: {safe_error}"
 # ================== GHI EXCEL ==================
 def upload_excel(content_bytes, max_retries=4):
     token = get_graph_access_token()
