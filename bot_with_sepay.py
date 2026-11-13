@@ -108,6 +108,21 @@ def _encoded_file_path():
 
 # ================== ĐỌC EXCEL ==================
 
+# ================== ĐỌC EXCEL ==================
+def download_excel_for_write():
+    token = get_graph_access_token()
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{_encoded_file_path()}:/content"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    if resp.status_code != 200:
+        raise Exception(f"Graph API tải file lỗi {resp.status_code}: {resp.text[:300]}")
+    return resp.content
+
+def get_excel_data():
+    try:
+        with excel_write_lock:
+            content = download_excel_for_write() # <-- Nó gọi hàm ở trên
+        workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        # ... (phần còn lại của hàm get_excel_data giữ nguyên) ...
 def get_excel_data():
     try:
         with excel_write_lock:
