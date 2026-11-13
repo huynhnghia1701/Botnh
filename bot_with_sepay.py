@@ -225,3 +225,84 @@ def append_transaction_and_upload(amount, is_income):
 
         del workbook, sheet, content, buf
         gc.collect()
+        # ================== API TEST (dùng để debug trên Render) ==================
+API_TEST_TOKEN = os.getenv("API_TEST_TOKEN", "")  # đặt env để bảo vệ endpoint
+
+def _check_api_auth():
+    if not API_TEST_TOKEN:
+        return True  # nếu chưa đặt thì bỏ qua (chỉ dùng khi test local)
+    return request.headers.get("X-Api-Token") == API_TEST_TOKEN
+
+
+@app_web.route("/ping", methods=["GET"])
+def ping():
+    return "OK", 200
+
+
+@app_web.route("/api/excel/read", methods=["GET"])
+def api_excel_read():
+    """GET: đọc toàn bộ dữ liệu thu/chi trong Excel."""
+    if not _check_api_auth():
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    try:
+        with excel_write_lock:
+            content = download_excel_for_write()
+        workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        sheet = workbook.active
+
+        rows = []
+        for i in range(EXCEL_DATA_START_ROW, EXCEL_DATA_END_ROW + 1):
+            thu = sheet.cell(row=i, column=1).value
+            chi = sheet.cell(row=i, column=2).value
+            if thu is not None or chi is not None:
+                rows.append({"row": i, "thu": thu, "chi": chi})
+
+        thu_total = sum(r["thu"] for r in rows if isinstance(r["thu"], (int, float)))
+        chi_total = sum(r["chi"] for r in rows if isinstance(r["chi"], (int, float)))
+
+        return jsonify({
+            "success": True,
+            "file_path": ONEDRIVE_FILE_PATH,
+            "rows": rows,
+            "thu_total": thu_total,
+            "chi_total": chi_total,
+            "remain": thu_total - chi_total,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app_web.route("/api/excel/append", methods=["POST"])
+def api_excel_append():
+    """
+    POST body JSON:
+      { "amount": 2550000, "type": "expense" }   # hoặc "income"
+    """
+    if not _check_api_auth():
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        amount = int(data.get("amount", 0))
+        if amount <= 0:
+            return jsonify({"success": False, "error": "amount phải > 0"}), 400
+        is_income = data.get("type", "expense") == "income"
+        append_transaction_and_upload(amount, is_income)
+        return jsonify({
+            "success": True,
+            "amount": amount,
+            "type": "income" if is_income else "expense",
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app_web.route("/api/graph/token", methods=["GET"])
+def api_graph_token():
+    """GET: kiểm tra Graph API có lấy được token không (không trả token thật)."""
+    if not _check_api_auth():
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    try:
+        token = get_graph_access_token()
+        return jsonify({"success": True, "token_prefix": token[:20] + "..."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
