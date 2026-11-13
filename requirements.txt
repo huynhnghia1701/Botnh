@@ -1,6 +1,7 @@
-Flask
+python-telegram-bot==21.6
+flask
+waitress
 requests
-openpyxl
 msal
+openpyxl
 pytz
-python-telegram-bot
